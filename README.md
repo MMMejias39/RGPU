@@ -273,12 +273,28 @@ onde 4× a aritmética saiu de graça no relógio e custou 7% no wattímetro.
 A fusão é **reescrita algébrica exata**: o teste confere que o estado fundido é
 idêntico ao direto, com erro de 1,2·10⁻⁷.
 
-**Fundir além de dois qubits não compensa** — implementado e medido. Um kernel
-genérico de até 4 qubits reduz 308 portas a 40, e o circuito fica **22% mais
-lento** que com 112: o kernel genérico custa mais por porta do que economiza em
-passadas. A causa é o desenho dele — 64 threads em vez de 256, estagiagem em
-memória compartilhada, laços de limite variável — e não a ideia. Detalhes em
-[`RESULTADOS-NEGATIVOS.md`](RESULTADOS-NEGATIVOS.md).
+### Fundir em unitárias de três qubits
+
+Um kernel **genérico** de até 4 qubits reduz 308 portas a 40 e deixa o circuito
+22% **mais lento** — ele estagia as amplitudes em memória de workgroup, usa 64
+threads em vez de 256 e percorre a matriz com laços de limite variável.
+
+Um kernel **especializado** para três qubits, com as 8 amplitudes em
+registradores e os 64 elementos da matriz endereçados por índices literais,
+inverte o resultado:
+
+| Máx. qubits | Portas | Kernel genérico | Especializado | Ganho |
+|---:|---:|---:|---:|---:|
+| 2 | 112 | 545 ms | 569 ms | 2,74× |
+| **3** | 58 | 595 ms | **293 ms** | **5,32×** |
+| 4 | 40 | 667 ms | 690 ms | 2,26× |
+
+**5,32× em tempo e 4,64× em energia.** E 58 portas contra 112 dão 1,93× menos
+passadas para 1,94× menos tempo — quase exatamente proporcional, que é o que se
+espera quando o limite é banda e o kernel não está handicapado.
+
+Quatro qubits ainda usa o kernel genérico, e ainda perde. Especializá-lo é o
+passo seguinte óbvio.
 
 ### Contra o Qiskit Aer e o cuQuantum
 

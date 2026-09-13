@@ -163,24 +163,28 @@ impl PortaN {
 /// Fundir além de dois qubits reduz muito a contagem de portas e **aumenta** o
 /// tempo. Circuito de 4 camadas em 26 qubits:
 ///
+/// Circuito de 4 camadas em 26 qubits, com **este** kernel servindo 3 e 4
+/// qubits:
+///
 /// | Máx. qubits | Portas | ms | Ganho |
 /// |---|---|---|---|
 /// | sem fusão | 308 | 1.493 | — |
-/// | 2 | 112 | **545** | **2,74×** |
+/// | 2 | 112 | 545 | 2,74× |
 /// | 3 | 58 | 595 | 2,51× |
 /// | 4 | 40 | 667 | 2,24× |
 ///
-/// Com 40 portas em vez de 112 — quase um terço — o circuito fica 22% mais
-/// lento. O kernel genérico custa mais por porta do que economiza em passadas.
+/// Com 40 portas em vez de 112 o circuito ficava 22% mais lento. A causa está
+/// no desenho abaixo: 64 threads por workgroup em vez de 256, estagiagem em
+/// memória compartilhada, e laços com limite variável que o compilador não
+/// desenrola.
 ///
-/// A causa está no próprio desenho abaixo: 64 threads por workgroup em vez de
-/// 256, estagiagem em memória compartilhada, e laços com limite variável que o
-/// compilador não desenrola. Um kernel especializado para 3 qubits, com índices
-/// constantes como nos de 1 e 2, provavelmente inverteria o resultado — mas não
-/// foi escrito.
+/// [`PORTA3`] confirmou o diagnóstico: especializando três qubits com índices
+/// constantes, o mesmo circuito caiu de 595 para **293 ms**, e a fusão até 3
+/// passou a ser a melhor opção. Quatro qubits ainda usa este kernel, e ainda
+/// perde — especializá-lo é o passo seguinte óbvio.
 ///
-/// Por isso [`Estado::aplicar_circuito_fundido`] despacha portas de 1 e 2
-/// qubits para os kernels especializados, e só usa este a partir de 3.
+/// Por isso [`Estado::aplicar_circuito_fundido`] despacha portas de 1, 2 e 3
+/// qubits para os kernels especializados, e só usa este em 4.
 ///
 /// Cada thread cuida de um grupo de `2ᴺ` amplitudes e as estagia em memória de
 /// workgroup — **na sua própria fatia**, sem compartilhar com as vizinhas, o que
@@ -261,5 +265,152 @@ fn porta_n(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l:
         }
         psi[idx] = buf[saida + m];
     }
+}
+"#;
+
+/// Kernel especializado de três qubits.
+///
+/// # Por que existe
+///
+/// O kernel genérico [`PORTA_N`] estagia as amplitudes em memória de workgroup
+/// e percorre a matriz com laços de limite variável — necessário para servir a
+/// qualquer `N`, e caro. Medido, fundir em unitárias de 3 qubits com ele
+/// deixava o circuito **mais lento** que fundir só até 2.
+///
+/// Aqui `N` é fixo: as 8 amplitudes ficam em registradores, os 64 elementos da
+/// matriz são endereçados por **índices literais**, e o workgroup volta a ter
+/// 256 threads. Não há memória compartilhada nem um único laço.
+///
+/// A escolha de índices constantes não é estilo: `rtensor/examples/ocupacao.rs`
+/// mediu que um array percorrido por índice de laço desaba para 25% da vazão,
+/// porque o compilador deixa de desenrolar e derrama para memória local.
+pub const PORTA3: &str = r#"
+// Mesmo layout do kernel genérico, para que os dois compartilhem o uniforme.
+// `n` é sempre 3 aqui e fica sem uso.
+struct P {
+    grupos: u32, n: u32, gx: u32, pad: u32,
+    alvos: vec4<u32>,
+    ordenados: vec4<u32>,
+};
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> matriz: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> psi: array<vec2<f32>>;
+
+fn cmul(c: vec2<f32>, a: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(c.x * a.x - c.y * a.y, c.x * a.y + c.y * a.x);
+}
+
+@compute @workgroup_size(256)
+fn porta3(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+    let g = (w.y * p.gx + w.x) * 256u + l.x;
+    if (g >= p.grupos) { return; }
+
+    // Insere três bits zero nas posições dos alvos, em ordem crescente. Cada
+    // inserção usa a posição final, e por isso a ordem importa: aplicar do
+    // menor para o maior mantém as posições seguintes válidas.
+    let o0 = p.ordenados.x;
+    let o1 = p.ordenados.y;
+    let o2 = p.ordenados.z;
+    var base = ((g >> o0) << (o0 + 1u)) | (g & ((1u << o0) - 1u));
+    base = ((base >> o1) << (o1 + 1u)) | (base & ((1u << o1) - 1u));
+    base = ((base >> o2) << (o2 + 1u)) | (base & ((1u << o2) - 1u));
+
+    // Os bits na ordem em que a base da matriz os espera — `alvos`, não
+    // `ordenados`: a base é Σ bᵢ·2ⁱ sobre os alvos como o chamador os deu.
+    let b0 = 1u << p.alvos.x;
+    let b1 = 1u << p.alvos.y;
+    let b2 = 1u << p.alvos.z;
+
+    let i0 = base;
+    let i1 = base | b0;
+    let i2 = base | b1;
+    let i3 = base | b0 | b1;
+    let i4 = base | b2;
+    let i5 = base | b0 | b2;
+    let i6 = base | b1 | b2;
+    let i7 = base | b0 | b1 | b2;
+
+    let a0 = psi[i0];
+    let a1 = psi[i1];
+    let a2 = psi[i2];
+    let a3 = psi[i3];
+    let a4 = psi[i4];
+    let a5 = psi[i5];
+    let a6 = psi[i6];
+    let a7 = psi[i7];
+
+    let r0 = cmul(matriz[0], a0)
+        + cmul(matriz[1], a1)
+        + cmul(matriz[2], a2)
+        + cmul(matriz[3], a3)
+        + cmul(matriz[4], a4)
+        + cmul(matriz[5], a5)
+        + cmul(matriz[6], a6)
+        + cmul(matriz[7], a7);
+    let r1 = cmul(matriz[8], a0)
+        + cmul(matriz[9], a1)
+        + cmul(matriz[10], a2)
+        + cmul(matriz[11], a3)
+        + cmul(matriz[12], a4)
+        + cmul(matriz[13], a5)
+        + cmul(matriz[14], a6)
+        + cmul(matriz[15], a7);
+    let r2 = cmul(matriz[16], a0)
+        + cmul(matriz[17], a1)
+        + cmul(matriz[18], a2)
+        + cmul(matriz[19], a3)
+        + cmul(matriz[20], a4)
+        + cmul(matriz[21], a5)
+        + cmul(matriz[22], a6)
+        + cmul(matriz[23], a7);
+    let r3 = cmul(matriz[24], a0)
+        + cmul(matriz[25], a1)
+        + cmul(matriz[26], a2)
+        + cmul(matriz[27], a3)
+        + cmul(matriz[28], a4)
+        + cmul(matriz[29], a5)
+        + cmul(matriz[30], a6)
+        + cmul(matriz[31], a7);
+    let r4 = cmul(matriz[32], a0)
+        + cmul(matriz[33], a1)
+        + cmul(matriz[34], a2)
+        + cmul(matriz[35], a3)
+        + cmul(matriz[36], a4)
+        + cmul(matriz[37], a5)
+        + cmul(matriz[38], a6)
+        + cmul(matriz[39], a7);
+    let r5 = cmul(matriz[40], a0)
+        + cmul(matriz[41], a1)
+        + cmul(matriz[42], a2)
+        + cmul(matriz[43], a3)
+        + cmul(matriz[44], a4)
+        + cmul(matriz[45], a5)
+        + cmul(matriz[46], a6)
+        + cmul(matriz[47], a7);
+    let r6 = cmul(matriz[48], a0)
+        + cmul(matriz[49], a1)
+        + cmul(matriz[50], a2)
+        + cmul(matriz[51], a3)
+        + cmul(matriz[52], a4)
+        + cmul(matriz[53], a5)
+        + cmul(matriz[54], a6)
+        + cmul(matriz[55], a7);
+    let r7 = cmul(matriz[56], a0)
+        + cmul(matriz[57], a1)
+        + cmul(matriz[58], a2)
+        + cmul(matriz[59], a3)
+        + cmul(matriz[60], a4)
+        + cmul(matriz[61], a5)
+        + cmul(matriz[62], a6)
+        + cmul(matriz[63], a7);
+
+    psi[i0] = r0;
+    psi[i1] = r1;
+    psi[i2] = r2;
+    psi[i3] = r3;
+    psi[i4] = r4;
+    psi[i5] = r5;
+    psi[i6] = r6;
+    psi[i7] = r7;
 }
 "#;

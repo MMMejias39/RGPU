@@ -38,7 +38,9 @@ negativo tem lugar neste repositório.
 | Strassen de um nível | **+11 a 13%** acima de 4096³, **−52%** em 1024³ | opcional |
 | Split-K | **+12,6× a 21,4×** em formas K-dominantes | opcional |
 | Fusão de portas até 2 qubits (`rqubit`) | **2,7× a 3,1×** em tempo e energia | padrão |
-| Fusão em unitárias de 3–4 qubits | **−9% a −22%** apesar de 3× menos portas | mantida, não padrão |
+| Fusão em 3 qubits, kernel **genérico** | **−9%** apesar de 2× menos portas | substituída |
+| Fusão em 3 qubits, kernel **especializado** | **5,32×** em tempo, 4,64× em energia | em produção |
+| Fusão em 4 qubits (kernel genérico) | **−22%** apesar de 3× menos portas | mantida, não padrão |
 | Precisão mista `f16`/`f32` | **+1 a 7%** de velocidade, **−5 a 11%** de energia | mantida por outra razão |
 | Bloco `8×4` por thread | **nulo** | [revertido](experimentos/gemm-8x4/) |
 | Matriz cooperativa (tensor cores) | **não funcional** e exige `unsafe` | sonda mantida |
@@ -140,9 +142,14 @@ limite variável que o compilador não desenrola. Um kernel especializado para 3
 qubits, com índices constantes como nos de 1 e 2, provavelmente inverteria o
 resultado — mas não foi escrito.
 
-**Mantida**, porque é correta e é o caminho se o kernel melhorar; o padrão é
-`max_qubits = 2`, e portas de 1 e 2 qubits são despachadas para os kernels
-especializados mesmo quando a fusão permite mais.
+**O diagnóstico foi testado e confirmou-se.** Escrevendo um kernel
+especializado para três qubits — 8 amplitudes em registradores, 64 elementos de
+matriz por índice literal, 256 threads, sem memória compartilhada nem um único
+laço — o mesmo circuito caiu de 595 para **293 ms**, e a fusão até 3 virou a
+melhor opção: **5,32×** contra os 2,74× do limite de 2.
+
+Era o desenho do kernel, não a ideia. Quatro qubits continua no genérico e
+continua perdendo; especializá-lo é o passo seguinte.
 
 Uma nota de método: a primeira medição deu números piores ainda, porque eu
 mandava até as portas de 1 e 2 qubits para o kernel genérico. Corrigir o

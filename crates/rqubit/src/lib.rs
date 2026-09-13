@@ -477,6 +477,7 @@ pub struct Estado {
     pipeline: wgpu::ComputePipeline,
     pipeline2: wgpu::ComputePipeline,
     pipeline_n: wgpu::ComputePipeline,
+    pipeline3: wgpu::ComputePipeline,
 }
 
 impl Estado {
@@ -569,7 +570,22 @@ impl Estado {
                 cache: None,
             });
 
-        Ok(Estado { qubits, precisao, buf, pipeline, pipeline2, pipeline_n })
+        let modulo3 = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("porta3"),
+            source: wgpu::ShaderSource::Wgsl(porta_n::PORTA3.into()),
+        });
+        let pipeline3 = gpu
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("porta3"),
+                layout: None,
+                module: &modulo3,
+                entry_point: Some("porta3"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Ok(Estado { qubits, precisao, buf, pipeline, pipeline2, pipeline_n, pipeline3 })
     }
 
     pub fn qubits(&self) -> usize {
@@ -946,8 +962,9 @@ impl Estado {
         assert!(porta.alvos.iter().all(|q| *q < self.qubits));
         assert_eq!(self.precisao, Precisao::F32, "kernel de N qubits só em f32");
 
+        let especializado = k == 3;
         let grupos = self.amplitudes() >> k;
-        let blocos = grupos.div_ceil(64);
+        let blocos = grupos.div_ceil(if especializado { 256 } else { 64 });
         let (gx, gy) = if blocos <= 32768 {
             (blocos as u32, 1u32)
         } else {
@@ -989,7 +1006,8 @@ impl Estado {
 
         let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &self.pipeline_n.get_bind_group_layout(0),
+            layout: &if especializado { &self.pipeline3 } else { &self.pipeline_n }
+                .get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: uniforme.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: mat.as_entire_binding() },
@@ -998,10 +1016,10 @@ impl Estado {
         });
 
         let mut passe = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("porta_n"),
+            label: if especializado { Some("porta3") } else { Some("porta_n") },
             timestamp_writes: None,
         });
-        passe.set_pipeline(&self.pipeline_n);
+        passe.set_pipeline(if especializado { &self.pipeline3 } else { &self.pipeline_n });
         passe.set_bind_group(0, &bind, &[]);
         passe.dispatch_workgroups(gx, gy, 1);
     }
