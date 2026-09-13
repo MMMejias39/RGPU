@@ -80,6 +80,24 @@ isso domina tudo o mais.
 18× mais lento que o PyTorch, por uma razão conhecida: **o caminho de CPU é
 monothread**, enquanto os outros usam os 22 núcleos.
 
+### GEMM
+
+O núcleo é ladrilhado em dois níveis, como no cuBLAS: ladrilho 64×64 por
+workgroup em memória compartilhada, bloco 4×4 por thread em registradores, com
+**buffer duplo** — as leituras do ladrilho `t+1` são emitidas antes do cálculo
+sobre o ladrilho `t`, escondendo a latência da memória atrás da aritmética.
+
+| `C[2048³]` | GFLOP/s |
+|---|---:|
+| ingênuo, 1 elemento por thread | 840 |
+| ladrilhado | 3.290 |
+| ladrilhado + buffer duplo | **4.002** |
+| cuBLAS (via TensorFlow, com TF32) | 11.946 |
+
+Ainda 3× atrás do cuBLAS. Mas com o TF32 desligado o TensorFlow cai só 12%, o
+que localiza a maior parte da diferença em pipelining, tiling multinível e
+swizzling — todos ao alcance do WGSL — e não nos tensor cores.
+
 ### Reproduzindo
 
 ```bash

@@ -18,6 +18,18 @@
 //! O acumulador é `array<vec4<f32>, 4>` com índices constantes, para que o
 //! compilador o mantenha em registradores em vez de derramar para memória local.
 //!
+//! # Buffer duplo
+//!
+//! Sem sobreposição, cada iteração do laço de `K` para esperando a memória
+//! global antes de poder calcular. O WebGPU não tem cópia assíncrona (`cp.async`
+//! do CUDA), mas o efeito se obtém à mão: as leituras do ladrilho `t+1` são
+//! **emitidas antes** do cálculo sobre o ladrilho `t` e ficam em registradores,
+//! de modo que a latência corre por baixo da aritmética.
+//!
+//! São dois ladrilhos em memória compartilhada, alternados: 16 KB dos 48 KB
+//! disponíveis. E como escrever no buffer ocioso não conflita com ler o ativo,
+//! o padrão também reduz de duas para **uma barreira por iteração**.
+//!
 //! As três variantes diferem apenas em como preenchem os ladrilhos:
 //!
 //! - `mm`      — `A[M,K] · B[K,N]`
@@ -33,18 +45,104 @@ struct Dims { m: u32, n: u32, k: u32, pad: u32 };
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read_write> c: array<f32>;
 
-const TM: u32 = 64u;   // ladrilho de saída em linhas
-const TN: u32 = 64u;   // ladrilho de saída em colunas
-const TK: u32 = 16u;   // passo na dimensão interna
+const TM: u32 = 64u;
+const TN: u32 = 64u;
+const TK: u32 = 16u;
 const THREADS: u32 = 256u;
+const BUF: u32 = 1024u;   // um ladrilho; há dois, alternados
 
-var<workgroup> sa: array<f32, 1024>;   // [TK][TM]
-var<workgroup> sb: array<f32, 1024>;   // [TK][TN]
+var<workgroup> sa: array<f32, 2048>;
+var<workgroup> sb: array<f32, 2048>;
 
-fn acumula(ty: u32, tx: u32, acc: ptr<function, array<vec4<f32>, 4>>) {
+// --- leituras globais, uma por variante ---------------------------------
+
+// A guardada como [M, K]: lê a linha, `kx` contíguo entre threads vizinhas.
+fn le_a_mk(tid: u32, lin0: u32, t: u32) -> vec4<f32> {
+    var r: vec4<f32>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let idx = tid + i * THREADS;
+        let gr = lin0 + idx / TK;
+        let gk = t * TK + idx % TK;
+        r[i] = select(0.0, a[gr * d.k + gk], gr < d.m && gk < d.k);
+    }
+    return r;
+}
+
+// A guardada como [K, M]: a transposta já está no layout desejado.
+fn le_a_km(tid: u32, lin0: u32, t: u32) -> vec4<f32> {
+    var r: vec4<f32>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let idx = tid + i * THREADS;
+        let gk = t * TK + idx / TM;
+        let gr = lin0 + idx % TM;
+        r[i] = select(0.0, a[gk * d.m + gr], gr < d.m && gk < d.k);
+    }
+    return r;
+}
+
+// B guardada como [K, N].
+fn le_b_kn(tid: u32, col0: u32, t: u32) -> vec4<f32> {
+    var r: vec4<f32>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let idx = tid + i * THREADS;
+        let gk = t * TK + idx / TN;
+        let gc = col0 + idx % TN;
+        r[i] = select(0.0, b[gk * d.n + gc], gk < d.k && gc < d.n);
+    }
+    return r;
+}
+
+// B guardada como [N, K]: lê a linha de B, `kx` contíguo.
+fn le_b_nk(tid: u32, col0: u32, t: u32) -> vec4<f32> {
+    var r: vec4<f32>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let idx = tid + i * THREADS;
+        let gc = col0 + idx / TK;
+        let gk = t * TK + idx % TK;
+        r[i] = select(0.0, b[gc * d.k + gk], gk < d.k && gc < d.n);
+    }
+    return r;
+}
+
+// --- escrita no buffer compartilhado ------------------------------------
+//
+// O destino em memória compartilhada é sempre [K][M] e [K][N], qualquer que
+// seja o layout de origem: é o que o laço interno quer ler.
+
+fn guarda_a_mk(tid: u32, buf: u32, r: vec4<f32>) {
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let idx = tid + i * THREADS;
+        sa[buf * BUF + (idx % TK) * TM + idx / TK] = r[i];
+    }
+}
+
+fn guarda_a_km(tid: u32, buf: u32, r: vec4<f32>) {
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let idx = tid + i * THREADS;
+        sa[buf * BUF + (idx / TM) * TM + idx % TM] = r[i];
+    }
+}
+
+fn guarda_b_kn(tid: u32, buf: u32, r: vec4<f32>) {
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let idx = tid + i * THREADS;
+        sb[buf * BUF + (idx / TN) * TN + idx % TN] = r[i];
+    }
+}
+
+fn guarda_b_nk(tid: u32, buf: u32, r: vec4<f32>) {
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let idx = tid + i * THREADS;
+        sb[buf * BUF + (idx % TK) * TN + idx / TK] = r[i];
+    }
+}
+
+// --- núcleo compartilhado -----------------------------------------------
+
+fn acumula(buf: u32, ty: u32, tx: u32, acc: ptr<function, array<vec4<f32>, 4>>) {
     for (var kk = 0u; kk < TK; kk = kk + 1u) {
-        let ab = kk * TM + ty * 4u;
-        let bb = kk * TN + tx * 4u;
+        let ab = buf * BUF + kk * TM + ty * 4u;
+        let bb = buf * BUF + kk * TN + tx * 4u;
         let av = vec4<f32>(sa[ab], sa[ab + 1u], sa[ab + 2u], sa[ab + 3u]);
         let bv = vec4<f32>(sb[bb], sb[bb + 1u], sb[bb + 2u], sb[bb + 3u]);
         (*acc)[0] = (*acc)[0] + av.x * bv;
@@ -85,27 +183,28 @@ fn mm(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3
     let lin0 = w.y * TM;
     let col0 = w.x * TN;
     var acc = array<vec4<f32>, 4>();
+    let n = passos();
 
-    for (var t = 0u; t < passos(); t = t + 1u) {
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            let idx = tid + i * THREADS;
-            let mm_ = idx / TK;            // 0..63, linha dentro do ladrilho
-            let kx = idx % TK;             // 0..15, contígua entre threads vizinhas
-            let gr = lin0 + mm_;
-            let gk = t * TK + kx;
-            sa[kx * TM + mm_] = select(0.0, a[gr * d.k + gk], gr < d.m && gk < d.k);
+    guarda_a_mk(tid, 0u, le_a_mk(tid, lin0, 0u));
+    guarda_b_kn(tid, 0u, le_b_kn(tid, col0, 0u));
+    workgroupBarrier();
+
+    var cur = 0u;
+    for (var t = 0u; t < n; t = t + 1u) {
+        var ra: vec4<f32>;
+        var rb: vec4<f32>;
+        let tem_proximo = t + 1u < n;
+        if (tem_proximo) {
+            ra = le_a_mk(tid, lin0, t + 1u);
+            rb = le_b_kn(tid, col0, t + 1u);
         }
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            let idx = tid + i * THREADS;
-            let kx = idx / TN;             // 0..15
-            let nn = idx % TN;             // 0..63, contígua
-            let gk = t * TK + kx;
-            let gc = col0 + nn;
-            sb[kx * TN + nn] = select(0.0, b[gk * d.n + gc], gk < d.k && gc < d.n);
+        acumula(cur, l.y, l.x, &acc);
+        if (tem_proximo) {
+            guarda_a_mk(tid, 1u - cur, ra);
+            guarda_b_kn(tid, 1u - cur, rb);
         }
         workgroupBarrier();
-        acumula(l.y, l.x, &acc);
-        workgroupBarrier();
+        cur = 1u - cur;
     }
     escreve(lin0 + l.y * 4u, col0 + l.x * 4u, acc);
 }
@@ -116,27 +215,28 @@ fn mm_atb(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: 
     let lin0 = w.y * TM;
     let col0 = w.x * TN;
     var acc = array<vec4<f32>, 4>();
+    let n = passos();
 
-    for (var t = 0u; t < passos(); t = t + 1u) {
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            let idx = tid + i * THREADS;
-            let kx = idx / TM;             // 0..15
-            let mm_ = idx % TM;            // 0..63, contígua — A é [K, M]
-            let gr = lin0 + mm_;
-            let gk = t * TK + kx;
-            sa[kx * TM + mm_] = select(0.0, a[gk * d.m + gr], gr < d.m && gk < d.k);
+    guarda_a_km(tid, 0u, le_a_km(tid, lin0, 0u));
+    guarda_b_kn(tid, 0u, le_b_kn(tid, col0, 0u));
+    workgroupBarrier();
+
+    var cur = 0u;
+    for (var t = 0u; t < n; t = t + 1u) {
+        var ra: vec4<f32>;
+        var rb: vec4<f32>;
+        let tem_proximo = t + 1u < n;
+        if (tem_proximo) {
+            ra = le_a_km(tid, lin0, t + 1u);
+            rb = le_b_kn(tid, col0, t + 1u);
         }
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            let idx = tid + i * THREADS;
-            let kx = idx / TN;
-            let nn = idx % TN;
-            let gk = t * TK + kx;
-            let gc = col0 + nn;
-            sb[kx * TN + nn] = select(0.0, b[gk * d.n + gc], gk < d.k && gc < d.n);
+        acumula(cur, l.y, l.x, &acc);
+        if (tem_proximo) {
+            guarda_a_km(tid, 1u - cur, ra);
+            guarda_b_kn(tid, 1u - cur, rb);
         }
         workgroupBarrier();
-        acumula(l.y, l.x, &acc);
-        workgroupBarrier();
+        cur = 1u - cur;
     }
     escreve(lin0 + l.y * 4u, col0 + l.x * 4u, acc);
 }
@@ -147,27 +247,28 @@ fn mm_abt(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: 
     let lin0 = w.y * TM;
     let col0 = w.x * TN;
     var acc = array<vec4<f32>, 4>();
+    let n = passos();
 
-    for (var t = 0u; t < passos(); t = t + 1u) {
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            let idx = tid + i * THREADS;
-            let mm_ = idx / TK;
-            let kx = idx % TK;
-            let gr = lin0 + mm_;
-            let gk = t * TK + kx;
-            sa[kx * TM + mm_] = select(0.0, a[gr * d.k + gk], gr < d.m && gk < d.k);
+    guarda_a_mk(tid, 0u, le_a_mk(tid, lin0, 0u));
+    guarda_b_nk(tid, 0u, le_b_nk(tid, col0, 0u));
+    workgroupBarrier();
+
+    var cur = 0u;
+    for (var t = 0u; t < n; t = t + 1u) {
+        var ra: vec4<f32>;
+        var rb: vec4<f32>;
+        let tem_proximo = t + 1u < n;
+        if (tem_proximo) {
+            ra = le_a_mk(tid, lin0, t + 1u);
+            rb = le_b_nk(tid, col0, t + 1u);
         }
-        for (var i = 0u; i < 4u; i = i + 1u) {
-            let idx = tid + i * THREADS;
-            let nn = idx / TK;             // 0..63
-            let kx = idx % TK;             // 0..15, contígua — B é [N, K]
-            let gk = t * TK + kx;
-            let gc = col0 + nn;
-            sb[kx * TN + nn] = select(0.0, b[gc * d.k + gk], gk < d.k && gc < d.n);
+        acumula(cur, l.y, l.x, &acc);
+        if (tem_proximo) {
+            guarda_a_mk(tid, 1u - cur, ra);
+            guarda_b_nk(tid, 1u - cur, rb);
         }
         workgroupBarrier();
-        acumula(l.y, l.x, &acc);
-        workgroupBarrier();
+        cur = 1u - cur;
     }
     escreve(lin0 + l.y * 4u, col0 + l.x * 4u, acc);
 }
