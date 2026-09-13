@@ -245,3 +245,61 @@ fn os_dois_gemms_treinam_igual() {
         assert!(e < 1e-3, "tensor {i}: os dois GEMMs divergiram, erro {e:.2e}");
     }
 }
+
+/// Strassen precisa acertar a conta e, sendo menos estável que o algoritmo
+/// clássico, o quanto ele perde em precisão é medido aqui em vez de suposto.
+#[test]
+fn strassen_confere_e_o_erro_extra_e_medido() {
+    use rtensor::gpu::Strassen;
+    let Some(gpu) = abrir() else { return };
+
+    for (m, n, k) in [(64usize, 64usize, 64usize), (128, 256, 128), (512, 512, 512)] {
+        let a = Tensor::new(&[m, k], (0..m * k).map(|i| (i as f32 * 0.017).sin()).collect());
+        let b = Tensor::new(&[k, n], (0..k * n).map(|i| (i as f32 * 0.011).cos()).collect());
+        let esperado = a.matmul(&b);
+
+        let ga = gpu.upload(&a);
+        let gb = gpu.upload(&b);
+        let c_classico = gpu.zeros(&[m, n]);
+        let c_strassen = gpu.zeros(&[m, n]);
+
+        let mut enc = gpu.encoder();
+        gpu.matmul(&mut enc, &ga, &gb, &c_classico);
+        gpu.submit(enc);
+
+        let plano = Strassen::novo(&gpu, &ga, &gb, &c_strassen).expect("plano");
+        let mut enc = gpu.encoder();
+        plano.executar(&gpu, &mut enc);
+        gpu.submit(enc);
+
+        let e_classico = erro_rel(&esperado, &gpu.download(&c_classico));
+        let e_strassen = erro_rel(&esperado, &gpu.download(&c_strassen));
+
+        eprintln!(
+            "{m}×{n}×{k}: clássico {e_classico:.2e}, Strassen {e_strassen:.2e} \
+             ({:.1}× o erro), {} dispatches",
+            e_strassen / e_classico.max(1e-12),
+            plano.dispatches()
+        );
+
+        // Strassen é menos estável, mas não a ponto de estar errado.
+        assert!(
+            e_strassen < 1e-4,
+            "{m}×{n}×{k}: Strassen com erro {e_strassen:.2e}"
+        );
+    }
+}
+
+#[test]
+fn strassen_recusa_dimensoes_impares() {
+    use rtensor::gpu::Strassen;
+    let Some(gpu) = abrir() else { return };
+    let a = gpu.zeros(&[15, 8]);
+    let b = gpu.zeros(&[8, 8]);
+    let c = gpu.zeros(&[15, 8]);
+    let erro = match Strassen::novo(&gpu, &a, &b, &c) {
+        Err(e) => e,
+        Ok(_) => panic!("deveria ter recusado dimensão ímpar"),
+    };
+    assert!(erro.contains("pares"), "mensagem inesperada: {erro}");
+}

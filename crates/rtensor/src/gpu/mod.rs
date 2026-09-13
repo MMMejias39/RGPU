@@ -47,6 +47,7 @@
 
 mod gemm;
 mod kernels;
+mod strassen;
 
 use std::cell::{Cell, RefCell};
 
@@ -71,6 +72,42 @@ struct Dims {
     p0: u32,
     p1: u32,
     p2: u32,
+}
+
+/// Uniforme do kernel que empacota combinações de blocos.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CombinaP {
+    linhas: u32,
+    colunas: u32,
+    ld: u32,
+    gx: u32,
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+    s1: f32,
+    s2: f32,
+    p0: u32,
+    p1: u32,
+}
+
+/// Uniforme do kernel que escreve um bloco de `C` a partir dos produtos.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct EspalhaP {
+    linhas: u32,
+    colunas: u32,
+    ld: u32,
+    gx: u32,
+    r0: u32,
+    c0: u32,
+    p0: u32,
+    p1: u32,
+    s1: f32,
+    s2: f32,
+    s3: f32,
+    s4: f32,
 }
 
 #[repr(C)]
@@ -112,6 +149,8 @@ enum Kernel {
     Xent,
     Colsum,
     Adam,
+    Combina,
+    Espalha,
 }
 
 /// Uma operação com tudo já resolvido: só falta gravá-la num encoder.
@@ -170,6 +209,8 @@ pub struct Gpu {
     mm_atb_f: wgpu::ComputePipeline,
     mm_abt_f: wgpu::ComputePipeline,
     mm_bias: wgpu::ComputePipeline,
+    combina: wgpu::ComputePipeline,
+    espalha: wgpu::ComputePipeline,
     bias_add: wgpu::ComputePipeline,
     relu: wgpu::ComputePipeline,
     relu_bwd: wgpu::ComputePipeline,
@@ -312,6 +353,8 @@ impl Gpu {
             mm_atb_f: pipe(gemm::MM_FAST, "mm_atb", "mm_atb_fast"),
             mm_abt_f: pipe(gemm::MM_FAST, "mm_abt", "mm_abt_fast"),
             mm_bias: pipe(gemm::MM_EPILOGO, "mm_bias", "mm_bias"),
+            combina: pipe(strassen::COMBINA, "combina", "combina"),
+            espalha: pipe(strassen::ESPALHA, "espalha", "espalha"),
             bias_add: pipe(kernels::VEC, "bias_add", "bias_add"),
             relu: pipe(kernels::VEC, "relu", "relu"),
             relu_bwd: pipe(kernels::RELU_BWD, "relu_bwd", "relu_bwd"),
@@ -376,6 +419,8 @@ impl Gpu {
             Kernel::Xent => &self.xent,
             Kernel::Colsum => &self.colsum,
             Kernel::Adam => &self.adam,
+            Kernel::Combina => &self.combina,
+            Kernel::Espalha => &self.espalha,
         }
     }
 
@@ -877,6 +922,85 @@ impl Gpu {
         }
     }
 
+    /// Empacota `s₁·A[bloco₁] + s₂·A[bloco₂]` num destino contíguo.
+    #[allow(clippy::too_many_arguments)]
+    pub fn op_combina(
+        &self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        ld: usize,
+        b1: (usize, usize),
+        b2: (usize, usize),
+        sinais: (f32, f32),
+        rotulo: &'static str,
+    ) -> Op {
+        let (linhas, colunas) = (dst.shape[0], dst.shape[1]);
+        let (gx, gy) = Self::grade((linhas * colunas).div_ceil(256));
+        self.montar(
+            Kernel::Combina,
+            CombinaP {
+                linhas: linhas as u32,
+                colunas: colunas as u32,
+                ld: ld as u32,
+                gx,
+                r1: b1.0 as u32,
+                c1: b1.1 as u32,
+                r2: b2.0 as u32,
+                c2: b2.1 as u32,
+                s1: sinais.0,
+                s2: sinais.1,
+                p0: 0,
+                p1: 0,
+            },
+            &[&src.buf, &dst.buf],
+            gx,
+            gy,
+            rotulo,
+        )
+    }
+
+    /// Escreve um bloco de `C` como combinação de até quatro produtos.
+    #[allow(clippy::too_many_arguments)]
+    pub fn op_espalha(
+        &self,
+        fontes: [&GpuTensor; 4],
+        c: &GpuTensor,
+        ld: usize,
+        canto: (usize, usize),
+        sinais: [f32; 4],
+        rotulo: &'static str,
+    ) -> Op {
+        let (linhas, colunas) = (fontes[0].shape[0], fontes[0].shape[1]);
+        let (gx, gy) = Self::grade((linhas * colunas).div_ceil(256));
+        self.montar(
+            Kernel::Espalha,
+            EspalhaP {
+                linhas: linhas as u32,
+                colunas: colunas as u32,
+                ld: ld as u32,
+                gx,
+                r0: canto.0 as u32,
+                c0: canto.1 as u32,
+                p0: 0,
+                p1: 0,
+                s1: sinais[0],
+                s2: sinais[1],
+                s3: sinais[2],
+                s4: sinais[3],
+            },
+            &[
+                &fontes[0].buf,
+                &fontes[1].buf,
+                &fontes[2].buf,
+                &fontes[3].buf,
+                &c.buf,
+            ],
+            gx,
+            gy,
+            rotulo,
+        )
+    }
+
     pub fn encoder(&self) -> wgpu::CommandEncoder {
         self.device.create_command_encoder(&Default::default())
     }
@@ -1147,6 +1271,113 @@ impl GpuMlp {
     /// montagem de descritores costumava seguir.
     pub fn dispatches_por_passo(&self) -> usize {
         self.ops_fwd.len() + self.ops_bwd.len() + self.ops_adam.len()
+    }
+}
+
+// -------------------------------------------------------------------- Strassen
+
+/// Produto matricial por Strassen de um nível.
+///
+/// Sete produtos de metade das dimensões no lugar de oito: **12,5% menos
+/// multiplicações**. Ver [`crate::gpu::strassen`] para as fórmulas e o custo
+/// numérico.
+///
+/// O plano — 14 empacotamentos, 7 produtos e 4 escritas — é montado uma vez na
+/// construção e apenas regravado a cada execução, como em [`GpuMlp`].
+pub struct Strassen {
+    plano: Vec<Op>,
+    /// Mantém vivos os buffers que o plano referencia.
+    _temporarios: Vec<GpuTensor>,
+    dimensoes: (usize, usize, usize),
+}
+
+impl Strassen {
+    /// Monta o plano para `C = A · B`. Exige `m`, `n` e `k` pares.
+    pub fn novo(gpu: &Gpu, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> Result<Strassen, String> {
+        let (m, k) = (a.shape[0], a.shape[1]);
+        let n = b.shape[1];
+        if b.shape[0] != k || c.shape[0] != m || c.shape[1] != n {
+            return Err("dimensões incompatíveis".into());
+        }
+        if m % 2 != 0 || n % 2 != 0 || k % 2 != 0 {
+            return Err(format!("Strassen exige m, n e k pares; recebido {m}×{n}×{k}"));
+        }
+        let (m2, n2, k2) = (m / 2, n / 2, k / 2);
+
+        let ta = gpu.zeros(&[m2, k2]);
+        let tb = gpu.zeros(&[k2, n2]);
+        let produtos: Vec<GpuTensor> = (0..7).map(|_| gpu.zeros(&[m2, n2])).collect();
+
+        // (bloco₁, bloco₂, sinais) de cada operando, na ordem M₁..M₇.
+        let lado_a = [
+            ((0, 0), (m2, k2), (1.0, 1.0)),    // A₁₁ + A₂₂
+            ((m2, 0), (m2, k2), (1.0, 1.0)),   // A₂₁ + A₂₂
+            ((0, 0), (0, 0), (1.0, 0.0)),      // A₁₁
+            ((m2, k2), (m2, k2), (1.0, 0.0)),  // A₂₂
+            ((0, 0), (0, k2), (1.0, 1.0)),     // A₁₁ + A₁₂
+            ((m2, 0), (0, 0), (1.0, -1.0)),    // A₂₁ − A₁₁
+            ((0, k2), (m2, k2), (1.0, -1.0)),  // A₁₂ − A₂₂
+        ];
+        let lado_b = [
+            ((0, 0), (k2, n2), (1.0, 1.0)),    // B₁₁ + B₂₂
+            ((0, 0), (0, 0), (1.0, 0.0)),      // B₁₁
+            ((0, n2), (k2, n2), (1.0, -1.0)),  // B₁₂ − B₂₂
+            ((k2, 0), (0, 0), (1.0, -1.0)),    // B₂₁ − B₁₁
+            ((k2, n2), (k2, n2), (1.0, 0.0)),  // B₂₂
+            ((0, 0), (0, n2), (1.0, 1.0)),     // B₁₁ + B₁₂
+            ((k2, 0), (k2, n2), (1.0, 1.0)),   // B₂₁ + B₂₂
+        ];
+
+        let mut plano = Vec::new();
+        for i in 0..7 {
+            let (b1, b2, sinais) = lado_a[i];
+            plano.push(gpu.op_combina(a, &ta, k, b1, b2, sinais, "strassen_pack_a"));
+            let (b1, b2, sinais) = lado_b[i];
+            plano.push(gpu.op_combina(b, &tb, n, b1, b2, sinais, "strassen_pack_b"));
+            plano.push(gpu.op_matmul(&ta, &tb, &produtos[i]));
+        }
+
+        // C₁₁ = M₁ + M₄ − M₅ + M₇   C₁₂ = M₃ + M₅
+        // C₂₁ = M₂ + M₄             C₂₂ = M₁ − M₂ + M₃ + M₆
+        let p = &produtos;
+        plano.push(gpu.op_espalha(
+            [&p[0], &p[3], &p[4], &p[6]], c, n, (0, 0),
+            [1.0, 1.0, -1.0, 1.0], "strassen_c11",
+        ));
+        plano.push(gpu.op_espalha(
+            [&p[2], &p[4], &p[0], &p[0]], c, n, (0, n2),
+            [1.0, 1.0, 0.0, 0.0], "strassen_c12",
+        ));
+        plano.push(gpu.op_espalha(
+            [&p[1], &p[3], &p[0], &p[0]], c, n, (m2, 0),
+            [1.0, 1.0, 0.0, 0.0], "strassen_c21",
+        ));
+        plano.push(gpu.op_espalha(
+            [&p[0], &p[1], &p[2], &p[5]], c, n, (m2, n2),
+            [1.0, -1.0, 1.0, 1.0], "strassen_c22",
+        ));
+
+        let mut temporarios = vec![ta, tb];
+        temporarios.extend(produtos);
+        Ok(Strassen { plano, _temporarios: temporarios, dimensoes: (m, n, k) })
+    }
+
+    /// Grava o plano. Cada operação num passe próprio: os temporários `ta` e
+    /// `tb` são reusados entre os sete produtos, e a separação em passes torna
+    /// a dependência entre empacotar e multiplicar explícita.
+    pub fn executar(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder) {
+        for op in &self.plano {
+            gpu.record(enc, op);
+        }
+    }
+
+    pub fn dimensoes(&self) -> (usize, usize, usize) {
+        self.dimensoes
+    }
+
+    /// Quantos dispatches o plano tem: 14 empacotamentos, 7 produtos e 4 escritas.
+    pub fn dispatches(&self) -> usize {
+        self.plano.len()
     }
 }
 

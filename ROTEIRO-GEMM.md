@@ -95,9 +95,12 @@ quase ninguém mede.
    a render, e a única que atacava a hierarquia de memória em vez do laço
    interno. `Gpu::set_grupo_l2` expõe o parâmetro; `1` reproduz o percurso em
    linha para comparação.
-2. **Strassen de um nível** — 12,5% menos multiplicações, com ganho medido de
-   20–32% na literatura de GPU, e um custo de precisão que este repositório tem
-   como quantificar.
+2. ~~**Strassen de um nível**~~ — **feito**. Ganho de **+11 a +13% em 4096³**,
+   capturando 90% do máximo teórico, mas **negativo abaixo de 4096**: −24% em
+   2048³ e −52% em 1024³. O custo de precisão ficou em 2,5× a 3,2× o erro do
+   clássico, bem abaixo das duas ordens de grandeza que a literatura reporta
+   para vários níveis em `n = 16384`. Não é automático, justamente por perder na
+   faixa comum.
 3. **Split-K** — não melhora o caso comum, mas corrige o patológico: o GEMM com
    `K` dominante roda a 55 GFLOP/s, 1,3% da capacidade da placa.
 

@@ -108,7 +108,36 @@ lento** — a sonda `examples/ocupacao.rs` explica por quê: aritmética pura
 sustenta 15–18 TFLOP/s nesta placa, e o GEMM anda a 4. Estando 4× longe do
 limite das ULAs, dobrar a intensidade aritmética só custa ocupação.
 
-Ainda 3× atrás do cuBLAS. Mas com o TF32 desligado o TensorFlow cai só 12%, o
+### Strassen de um nível
+
+Sete produtos de metade das dimensões no lugar de oito: **12,5% menos
+multiplicações**, à custa de somas `O(n²)`, empacotamento dos blocos e 25
+dispatches em vez de 1. Há um tamanho abaixo do qual não compensa, e ele foi
+medido:
+
+| Tamanho | Ganho | Erro máx. clássico | Erro máx. Strassen |
+|---:|---:|---:|---:|
+| 1024³ | −52,0% | 3,1·10⁻⁶ | 1,2·10⁻⁵ |
+| 2048³ | −23,6% | 4,5·10⁻⁶ | 1,3·10⁻⁵ |
+| **4096³** | **+11,2% a +13,3%** | 7,0·10⁻⁶ | 2,0·10⁻⁵ |
+| 6144³ | +8,6% | 1,9·10⁻⁵ | 3,1·10⁻⁵ |
+| 8192³ | +6,6% | 8,1·10⁻⁶ | 2,6·10⁻⁵ |
+
+O cruzamento fica entre 2048 e 4096, e o pico em 4096 captura **90% do ganho
+teórico** de 12,5%.
+
+Strassen satisfaz apenas um limite de erro por norma, e não o limite por
+elemento do algoritmo clássico. A literatura reporta cerca de duas ordens de
+grandeza de erro a mais, mas isso é com vários níveis de recursão em `n =
+16384`. Com **um** nível, nas faixas acima, o custo medido é de **2,5× a 3,2×**
+o erro do algoritmo clássico — número que a literatura não dá para estes
+tamanhos.
+
+Por perder abaixo de 4096, Strassen não é automático: `Strassen::novo` monta o
+plano explicitamente. `tests/gpu.rs` mede o erro extra a cada execução, em vez
+de supô-lo.
+
+Ainda 2,7× atrás do cuBLAS. Mas com o TF32 desligado o TensorFlow cai só 12%, o
 que localiza a maior parte da diferença em pipelining, tiling multinível e
 swizzling — todos ao alcance do WGSL — e não nos tensor cores.
 

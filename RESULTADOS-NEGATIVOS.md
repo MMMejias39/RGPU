@@ -34,6 +34,8 @@ negativo tem lugar neste repositório.
 | Padding contra conflito de bancos | **nulo** | mantido |
 | Bloco 8×8 por thread | **−5%** | [revertido](experimentos/gemm-8x8/) |
 | Leituras globais `vec4` | **nulo** | [revertido](experimentos/gemm-vec4/) |
+| Rasterização com consciência de L2 | **+5 a 6%** em 4096³ | em produção |
+| Strassen de um nível | **+11 a 13%** acima de 4096³, **−52%** em 1024³ | opcional |
 
 ### Bloco 8×8 por thread — rejeitado
 
