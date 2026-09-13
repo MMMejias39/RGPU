@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Fora do workspace: puxa burn e candle, que não devem pesar no build do núcleo.
+exclude = ["benchmarks/rivais"]
 
 [workspace.package]
 version = "0.1.0"

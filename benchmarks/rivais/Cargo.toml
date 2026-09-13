@@ -1,0 +1,21 @@
+[package]
+name = "rivais"
+version = "0.1.0"
+edition = "2021"
+description = "Mesma carga do rtensor, medida em burn e candle."
+
+[dependencies]
+burn = { version = "0.21", features = ["wgpu", "autodiff", "ndarray"] }
+candle-core = "0.11"
+candle-nn = "0.11"
+
+[[bin]]
+name = "burn_bench"
+path = "src/burn_bench.rs"
+
+[[bin]]
+name = "candle_bench"
+path = "src/candle_bench.rs"
+
+[profile.release]
+opt-level = 3
