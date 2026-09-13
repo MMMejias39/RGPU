@@ -40,7 +40,8 @@ negativo tem lugar neste repositório.
 | Fusão de portas até 2 qubits (`rqubit`) | **2,7× a 3,1×** em tempo e energia | padrão |
 | Fusão em 3 qubits, kernel **genérico** | **−9%** apesar de 2× menos portas | substituída |
 | Fusão em 3 qubits, kernel **especializado** | **5,32×** em tempo, 4,64× em energia | em produção |
-| Fusão em 4 qubits (kernel genérico) | **−22%** apesar de 3× menos portas | mantida, não padrão |
+| Fusão em 4 qubits, kernel **genérico** | **−22%** apesar de 3× menos portas | substituída |
+| Fusão em 4 qubits, kernel **especializado** | **7,65×** em tempo, 5,64× em energia | em produção |
 | Precisão mista `f16`/`f32` | **+1 a 7%** de velocidade, **−5 a 11%** de energia | mantida por outra razão |
 | Bloco `8×4` por thread | **nulo** | [revertido](experimentos/gemm-8x4/) |
 | Matriz cooperativa (tensor cores) | **não funcional** e exige `unsafe` | sonda mantida |
@@ -148,8 +149,13 @@ matriz por índice literal, 256 threads, sem memória compartilhada nem um únic
 laço — o mesmo circuito caiu de 595 para **293 ms**, e a fusão até 3 virou a
 melhor opção: **5,32×** contra os 2,74× do limite de 2.
 
-Era o desenho do kernel, não a ideia. Quatro qubits continua no genérico e
-continua perdendo; especializá-lo é o passo seguinte.
+Era o desenho do kernel, não a ideia — e vale para os dois tamanhos. O kernel
+especializado de quatro qubits levou o mesmo circuito de 690 para **204 ms**:
+**7,65×** sobre o circuito sem fusão, com 7,70× menos portas. Proporcional até
+o segundo decimal.
+
+O genérico fica no repositório como referência e caso de comparação, mas o
+caminho padrão não o usa mais.
 
 Uma nota de método: a primeira medição deu números piores ainda, porque eu
 mandava até as portas de 1 e 2 qubits para o kernel genérico. Corrigir o

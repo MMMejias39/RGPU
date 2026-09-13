@@ -478,6 +478,7 @@ pub struct Estado {
     pipeline2: wgpu::ComputePipeline,
     pipeline_n: wgpu::ComputePipeline,
     pipeline3: wgpu::ComputePipeline,
+    pipeline4: wgpu::ComputePipeline,
 }
 
 impl Estado {
@@ -585,7 +586,31 @@ impl Estado {
                 cache: None,
             });
 
-        Ok(Estado { qubits, precisao, buf, pipeline, pipeline2, pipeline_n, pipeline3 })
+        let modulo4 = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("porta4"),
+            source: wgpu::ShaderSource::Wgsl(porta_n::PORTA4.into()),
+        });
+        let pipeline4 = gpu
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("porta4"),
+                layout: None,
+                module: &modulo4,
+                entry_point: Some("porta4"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Ok(Estado {
+            qubits,
+            precisao,
+            buf,
+            pipeline,
+            pipeline2,
+            pipeline_n,
+            pipeline3,
+            pipeline4,
+        })
     }
 
     pub fn qubits(&self) -> usize {
@@ -955,6 +980,15 @@ struct PortaNP {
 }
 
 impl Estado {
+    /// Escolhe o kernel conforme o número de alvos.
+    fn pipeline_para(&self, k: usize) -> &wgpu::ComputePipeline {
+        match k {
+            3 => &self.pipeline3,
+            4 => &self.pipeline4,
+            _ => &self.pipeline_n,
+        }
+    }
+
     /// Grava uma porta de `N` qubits, com `N` até 4.
     pub fn aplicar_n(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, porta: &PortaN) {
         let k = porta.alvos.len();
@@ -962,7 +996,9 @@ impl Estado {
         assert!(porta.alvos.iter().all(|q| *q < self.qubits));
         assert_eq!(self.precisao, Precisao::F32, "kernel de N qubits só em f32");
 
-        let especializado = k == 3;
+        // 3 e 4 qubits têm kernel próprio; o genérico não é mais usado no
+        // caminho padrão, e fica como referência e caso de comparação.
+        let especializado = k == 3 || k == 4;
         let grupos = self.amplitudes() >> k;
         let blocos = grupos.div_ceil(if especializado { 256 } else { 64 });
         let (gx, gy) = if blocos <= 32768 {
@@ -1006,8 +1042,7 @@ impl Estado {
 
         let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &if especializado { &self.pipeline3 } else { &self.pipeline_n }
-                .get_bind_group_layout(0),
+            layout: &self.pipeline_para(k).get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: uniforme.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: mat.as_entire_binding() },
@@ -1016,10 +1051,10 @@ impl Estado {
         });
 
         let mut passe = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: if especializado { Some("porta3") } else { Some("porta_n") },
+            label: Some("porta_n"),
             timestamp_writes: None,
         });
-        passe.set_pipeline(if especializado { &self.pipeline3 } else { &self.pipeline_n });
+        passe.set_pipeline(self.pipeline_para(k));
         passe.set_bind_group(0, &bind, &[]);
         passe.dispatch_workgroups(gx, gy, 1);
     }

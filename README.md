@@ -273,28 +273,31 @@ onde 4× a aritmética saiu de graça no relógio e custou 7% no wattímetro.
 A fusão é **reescrita algébrica exata**: o teste confere que o estado fundido é
 idêntico ao direto, com erro de 1,2·10⁻⁷.
 
-### Fundir em unitárias de três qubits
+### Fundir em unitárias maiores
 
 Um kernel **genérico** de até 4 qubits reduz 308 portas a 40 e deixa o circuito
 22% **mais lento** — ele estagia as amplitudes em memória de workgroup, usa 64
 threads em vez de 256 e percorre a matriz com laços de limite variável.
 
-Um kernel **especializado** para três qubits, com as 8 amplitudes em
-registradores e os 64 elementos da matriz endereçados por índices literais,
-inverte o resultado:
+Kernels **especializados**, com as amplitudes em registradores e os elementos
+da matriz endereçados por índices literais, invertem o resultado:
 
-| Máx. qubits | Portas | Kernel genérico | Especializado | Ganho |
-|---:|---:|---:|---:|---:|
-| 2 | 112 | 545 ms | 569 ms | 2,74× |
-| **3** | 58 | 595 ms | **293 ms** | **5,32×** |
-| 4 | 40 | 667 ms | 690 ms | 2,26× |
+| Máx. qubits | Portas | Genérico | Especializado | Ganho | Energia |
+|---:|---:|---:|---:|---:|---:|
+| — | 308 | — | 1.558 ms | (base) | (base) |
+| 2 | 112 | 545 ms | 566 ms | 2,75× | 2,68× menos |
+| 3 | 58 | 595 ms | 294 ms | 5,30× | 4,63× menos |
+| **4** | **40** | 690 ms | **204 ms** | **7,65×** | **5,64× menos** |
 
-**5,32× em tempo e 4,64× em energia.** E 58 portas contra 112 dão 1,93× menos
-passadas para 1,94× menos tempo — quase exatamente proporcional, que é o que se
-espera quando o limite é banda e o kernel não está handicapado.
+308 portas contra 40 são **7,70× menos passadas** para **7,65× menos tempo** —
+proporcional até o segundo decimal, que é o que se espera quando o limite é
+banda e o kernel não está handicapado.
 
-Quatro qubits ainda usa o kernel genérico, e ainda perde. Especializá-lo é o
-passo seguinte óbvio.
+O ganho de energia fica em 5,64×, abaixo dos 7,65× de tempo. A diferença tem
+causa conhecida: uma porta de 4 qubits faz **8× mais aritmética por amplitude**
+que uma de 1 qubit. Numa carga limitada por banda isso não custa relógio — e
+custa watt, exatamente como na porta de dois qubits, onde 4× a aritmética saiu
+de graça no tempo e cobrou 7% na energia.
 
 ### Contra o Qiskit Aer e o cuQuantum
 
