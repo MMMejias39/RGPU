@@ -34,6 +34,7 @@ negativo tem lugar neste repositório.
 | Padding contra conflito de bancos | **nulo** | mantido |
 | Bloco 8×8 por thread | **−5%** | [revertido](experimentos/gemm-8x8/) |
 | Leituras globais `vec4` | **nulo** | [revertido](experimentos/gemm-vec4/) |
+| GEMM especializado para formas alinhadas | **nulo** | [revertido](experimentos/gemm-alinhado/) |
 | Rasterização com consciência de L2 | **+5 a 6%** em 4096³ | em produção |
 | Strassen de um nível | **+11 a 13%** acima de 4096³, **−52%** em 1024³ | opcional |
 | Split-K | **+12,6× a 21,4×** em formas K-dominantes | opcional |
@@ -92,6 +93,43 @@ código seguro. Adotá-la custaria a propriedade "zero `unsafe`" do projeto.
 
 Mesmo que funcionasse, essa troca mereceria discussão. Não funcionando, a
 decisão é simples: adiar. A sonda fica como caso de reprodução.
+
+### GEMM especializado para formas alinhadas — sem efeito
+
+Duas especializações, para `M` e `N` múltiplos de 64 e `K` de 16: o laço de `K`
+desenrolado com deslocamentos literais, e as leituras globais sem guarda de
+limite.
+
+A hipótese vinha do diagnóstico — o gargalo é vazão de instruções, e estas são
+instruções de puro overhead — e do que funcionara no `rqubit`, onde especializar
+com índices literais rendeu 5,32× e 7,65× sobre o kernel genérico.
+
+Quatro execuções em 4096³, três variantes cada:
+
+| Execução | Geral | Sem guardas + laço | Sem guardas, desenrolado |
+|---:|---:|---:|---:|
+| 1 | 4.274,8 | 4.280,6 | 4.285,7 |
+| 2 | 4.273,8 | 4.293,6 | 4.275,8 |
+| 3 | 4.220,8 | 4.212,2 | 4.229,0 |
+| 4 | 4.185,9 | 4.200,9 | 4.145,9 |
+
+Dentro de cada execução as três diferem menos de 1%; entre execuções a deriva
+térmica é de 3%. **São indistinguíveis.**
+
+A explicação provável: `TK` é constante, então o compilador já desenrolava o
+laço — a versão manual só engordou o código-fonte. E as guardas são 8 instruções
+contra 128 leituras compartilhadas e 64 FMAs por ladrilho: 4% do trabalho,
+abaixo do que a medição resolve.
+
+**Nota de método.** A primeira medição deu −3,3% e −4,4%, e eu quase publiquei
+"especialização piora o GEMM". Era deriva térmica entre as duas metades da mesma
+execução, porque eu media o geral e o alinhado em sequência. Só colocar as três
+variantes lado a lado, repetindo, mostrou que não há diferença nenhuma.
+
+**Por que funcionou no `rqubit` e não aqui.** Lá o kernel genérico estagiava
+amplitudes em memória compartilhada e percorria a matriz com laços de limite
+**variável**, que o compilador não podia desenrolar. Aqui o limite já era
+constante. Especializar só rende quando há generalidade de verdade a remover.
 
 ### Bloco 8×4 — rejeitado, e contraria o diagnóstico
 
