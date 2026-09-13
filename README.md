@@ -86,7 +86,15 @@ Varrer o **limite de potência** (`nvidia-smi -pl`) não é possível em GPU de
 notebook: o driver responde *"not supported in current scope"*, porque quem
 controla o envelope é o firmware do fabricante, com o Dynamic Boost ativo.
 `sudo` não contorna isso. Já **travar o clock** (`nvidia-smi -lgc`) falha por
-permissão, e portanto funciona com `sudo` — é o caminho para varrer frequência.
+permissão, e portanto funciona com `sudo` — é o caminho para varrer frequência:
+
+```bash
+cargo build -p rtensor --release --features gpu --example frequencia
+sudo ./target/release/examples/frequencia
+```
+
+A trava se desfaz sozinha ao fim de cada ponto e no encerramento. Se o processo
+for morto por sinal, o conserto é `sudo nvidia-smi -rgc`.
 
 A energia da CPU e da GPU integrada vem dos contadores RAPL, restritos a `root`
 desde a mitigação do PLATYPUS (2020).

@@ -57,3 +57,7 @@ required-features = ["gpu"]
 [[example]]
 name = "eficiencia"
 required-features = ["gpu"]
+
+[[example]]
+name = "frequencia"
+required-features = ["gpu"]

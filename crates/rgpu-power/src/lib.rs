@@ -46,6 +46,8 @@
 //! # fn minha_carga() -> u32 { 0 }
 //! ```
 
+pub mod clock;
+
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
