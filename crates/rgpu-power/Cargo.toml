@@ -1,0 +1,12 @@
+[package]
+name = "rgpu-power"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Medição de energia para cargas de computação: potência da GPU por nvidia-smi e energia da CPU por RAPL, sem dependências e sem unsafe."
+keywords = ["energy", "power", "gpu", "benchmark", "rapl"]
+categories = ["hardware-support", "development-tools::profiling"]
+
+[dependencies]

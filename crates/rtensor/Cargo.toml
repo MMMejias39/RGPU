@@ -46,3 +46,10 @@ required-features = ["gpu"]
 [[example]]
 name = "perfil"
 required-features = ["gpu"]
+
+[dev-dependencies]
+rgpu-power = { path = "../rgpu-power" }
+
+[[example]]
+name = "energia"
+required-features = ["gpu"]

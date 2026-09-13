@@ -189,7 +189,43 @@ impl Gpu {
             ..Default::default()
         }))
         .map_err(|e| format!("nenhum adaptador disponível: {e}"))?;
+        Gpu::a_partir_de(adapter)
+    }
 
+    /// Abre um adaptador específico pelo nome — o trecho basta, sem diferenciar
+    /// maiúsculas ("nvidia", "arc", "llvmpipe").
+    ///
+    /// Existe para comparar fabricantes rodando **o mesmo código**, que é a
+    /// razão de o backend ser WGSL e não CUDA.
+    pub fn com_adaptador(filtro: &str) -> Result<Gpu, String> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adaptadores = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        let alvo = filtro.to_lowercase();
+
+        let escolhido = adaptadores
+            .into_iter()
+            .find(|a| {
+                let i = a.get_info();
+                i.name.to_lowercase().contains(&alvo)
+                    && i.backend != wgpu::Backend::Gl
+            })
+            .ok_or_else(|| format!("nenhum adaptador com \"{filtro}\" no nome"))?;
+        Gpu::a_partir_de(escolhido)
+    }
+
+    /// Lista os adaptadores visíveis, como `(nome, tipo, backend)`.
+    pub fn listar() -> Vec<(String, String, String)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .iter()
+            .map(|a| {
+                let i = a.get_info();
+                (i.name.clone(), format!("{:?}", i.device_type), format!("{:?}", i.backend))
+            })
+            .collect()
+    }
+
+    fn a_partir_de(adapter: wgpu::Adapter) -> Result<Gpu, String> {
         let info = adapter.get_info();
         let etiqueta = format!("{} ({:?}, {:?})", info.name, info.device_type, info.backend);
 

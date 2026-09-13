@@ -9,6 +9,29 @@ Metal, DX12 ou WebGPU, então o mesmo código roda em NVIDIA, AMD, Intel e Apple
 | Crate | O que é |
 |---|---|
 | [`rtensor`](crates/rtensor) | Framework de deep learning: tensor com broadcasting, autodiff reverso, camadas, otimizadores e backend de GPU |
+| [`rgpu-power`](crates/rgpu-power) | Medição de energia: potência da GPU por `nvidia-smi`, energia da CPU e da GPU integrada por RAPL |
+
+## Por que energia, e não só tempo
+
+Tempo diz quão rápido; energia diz quanto custou. Um passo duas vezes mais
+rápido consumindo três vezes mais potência é um retrocesso de eficiência, e só
+a medição separa os dois casos.
+
+Isso importa porque o desperdício costuma estar na **pilha de software**, não
+no silício. Dois exemplos medidos neste repositório:
+
+- Na tarefa das espirais, o TensorFlow na RTX 4070 levou **9,29 s**; o
+  `rtensor` em **um núcleo de CPU** levou **0,11 s**. A placa de 80 W foi 84×
+  mais lenta que um núcleo.
+- Num GEMM com `K` dominante, rodamos a 54 GFLOP/s numa placa capaz de
+  ~15.000 — **0,4% da capacidade**, com a placa ligada e consumindo.
+
+Uma GPU subutilizada consome quase como uma GPU ocupada. Medir joules por
+unidade de trabalho é o que torna esse desperdício visível.
+
+```bash
+cargo run -p rtensor --release --features gpu --example energia
+```
 
 ## Estado
 
