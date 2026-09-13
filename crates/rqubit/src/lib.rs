@@ -124,6 +124,17 @@ fn soma(a: Complexo, b: Complexo) -> Complexo {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct Porta2P {
+    grupos: u32,
+    q0: u32,
+    q1: u32,
+    gx: u32,
+    /// A matriz 4×4 complexa, linha a linha: dois `vec4` por linha.
+    u: [f32; 32],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct PortaP {
     pares: u32,
     qubit: u32,
@@ -282,12 +293,186 @@ fn f16_para_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// Porta de dois qubits: matriz 4×4 complexa.
+///
+/// A base é ordenada por `2·b₁ + b₀`, onde `b₁` é o bit do qubit passado como
+/// `q1` e `b₀` o de `q0`. Para um CNOT, `q1` é o controle e `q0` o alvo.
+#[derive(Clone, Copy, Debug)]
+pub struct Porta2 {
+    pub u: [[Complexo; 4]; 4],
+}
+
+impl Porta2 {
+    /// Monta a partir de uma matriz de reais, para portas sem fase.
+    fn real(m: [[f32; 4]; 4]) -> Porta2 {
+        let mut u = [[(0.0, 0.0); 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                u[i][j] = (m[i][j], 0.0);
+            }
+        }
+        Porta2 { u }
+    }
+
+    /// CNOT: nega o alvo quando o controle é 1.
+    pub fn cnot() -> Porta2 {
+        Porta2::real([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ])
+    }
+
+    /// CZ: inverte a fase de |11⟩. Simétrica nos dois qubits.
+    pub fn cz() -> Porta2 {
+        Porta2::real([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, -1.0],
+        ])
+    }
+
+    /// SWAP: troca os dois qubits.
+    pub fn swap() -> Porta2 {
+        Porta2::real([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+    }
+
+    /// Aplica na CPU — a referência contra a qual a GPU é conferida.
+    pub fn aplicar_cpu(&self, psi: &mut [Complexo], q0: usize, q1: usize) {
+        assert_ne!(q0, q1, "uma porta de dois qubits precisa de dois qubits distintos");
+        let (qa, qb) = (q0.min(q1), q0.max(q1));
+        for g in 0..psi.len() / 4 {
+            let baixo = g & ((1 << qa) - 1);
+            let meio = (g >> qa) & ((1 << (qb - 1 - qa)) - 1);
+            let alto = g >> (qb - 1);
+            let i0 = (alto << (qb + 1)) | (meio << (qa + 1)) | baixo;
+            let idx = [i0, i0 | (1 << q0), i0 | (1 << q1), i0 | (1 << q0) | (1 << q1)];
+            let a = [psi[idx[0]], psi[idx[1]], psi[idx[2]], psi[idx[3]]];
+            for (linha, &destino) in idx.iter().enumerate() {
+                let mut acc = (0.0, 0.0);
+                for col in 0..4 {
+                    acc = soma(acc, mul(self.u[linha][col], a[col]));
+                }
+                psi[destino] = acc;
+            }
+        }
+    }
+}
+
+const PORTA2: &str = r#"
+struct P {
+    grupos: u32, q0: u32, q1: u32, gx: u32,
+    u0: vec4<f32>, u1: vec4<f32>,
+    u2: vec4<f32>, u3: vec4<f32>,
+    u4: vec4<f32>, u5: vec4<f32>,
+    u6: vec4<f32>, u7: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> psi: array<vec2<f32>>;
+
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+@compute @workgroup_size(256)
+fn porta2(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+    let g = (w.y * p.gx + w.x) * 256u + l.x;
+    if (g >= p.grupos) { return; }
+
+    // Insere dois bits zero em `g`, nas posições dos qubits alvo, para obter o
+    // índice do grupo com ambos os bits em 0. Os outros três saem ligando cada
+    // bit. Assim os 2ⁿ⁻² grupos cobrem os 2ⁿ índices sem repetição.
+    let qa = min(p.q0, p.q1);
+    let qb = max(p.q0, p.q1);
+    let baixo = g & ((1u << qa) - 1u);
+    let meio = (g >> qa) & ((1u << (qb - 1u - qa)) - 1u);
+    let alto = g >> (qb - 1u);
+    let i0 = (alto << (qb + 1u)) | (meio << (qa + 1u)) | baixo;
+    let i1 = i0 | (1u << p.q0);
+    let i2 = i0 | (1u << p.q1);
+    let i3 = i1 | (1u << p.q1);
+
+    let a0 = psi[i0];
+    let a1 = psi[i1];
+    let a2 = psi[i2];
+    let a3 = psi[i3];
+
+    let r0 = cmul(p.u0.xy, a0) + cmul(p.u0.zw, a1) + cmul(p.u1.xy, a2) + cmul(p.u1.zw, a3);
+    let r1 = cmul(p.u2.xy, a0) + cmul(p.u2.zw, a1) + cmul(p.u3.xy, a2) + cmul(p.u3.zw, a3);
+    let r2 = cmul(p.u4.xy, a0) + cmul(p.u4.zw, a1) + cmul(p.u5.xy, a2) + cmul(p.u5.zw, a3);
+    let r3 = cmul(p.u6.xy, a0) + cmul(p.u6.zw, a1) + cmul(p.u7.xy, a2) + cmul(p.u7.zw, a3);
+
+    psi[i0] = r0;
+    psi[i1] = r1;
+    psi[i2] = r2;
+    psi[i3] = r3;
+}
+"#;
+
+const PORTA2_F16: &str = r#"
+struct P {
+    grupos: u32, q0: u32, q1: u32, gx: u32,
+    u0: vec4<f32>, u1: vec4<f32>,
+    u2: vec4<f32>, u3: vec4<f32>,
+    u4: vec4<f32>, u5: vec4<f32>,
+    u6: vec4<f32>, u7: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> psi: array<u32>;
+
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+@compute @workgroup_size(256)
+fn porta2(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+    let g = (w.y * p.gx + w.x) * 256u + l.x;
+    if (g >= p.grupos) { return; }
+
+    // Insere dois bits zero em `g`, nas posições dos qubits alvo, para obter o
+    // índice do grupo com ambos os bits em 0. Os outros três saem ligando cada
+    // bit. Assim os 2ⁿ⁻² grupos cobrem os 2ⁿ índices sem repetição.
+    let qa = min(p.q0, p.q1);
+    let qb = max(p.q0, p.q1);
+    let baixo = g & ((1u << qa) - 1u);
+    let meio = (g >> qa) & ((1u << (qb - 1u - qa)) - 1u);
+    let alto = g >> (qb - 1u);
+    let i0 = (alto << (qb + 1u)) | (meio << (qa + 1u)) | baixo;
+    let i1 = i0 | (1u << p.q0);
+    let i2 = i0 | (1u << p.q1);
+    let i3 = i1 | (1u << p.q1);
+
+    let a0 = unpack2x16float(psi[i0]);
+    let a1 = unpack2x16float(psi[i1]);
+    let a2 = unpack2x16float(psi[i2]);
+    let a3 = unpack2x16float(psi[i3]);
+
+    let r0 = cmul(p.u0.xy, a0) + cmul(p.u0.zw, a1) + cmul(p.u1.xy, a2) + cmul(p.u1.zw, a3);
+    let r1 = cmul(p.u2.xy, a0) + cmul(p.u2.zw, a1) + cmul(p.u3.xy, a2) + cmul(p.u3.zw, a3);
+    let r2 = cmul(p.u4.xy, a0) + cmul(p.u4.zw, a1) + cmul(p.u5.xy, a2) + cmul(p.u5.zw, a3);
+    let r3 = cmul(p.u6.xy, a0) + cmul(p.u6.zw, a1) + cmul(p.u7.xy, a2) + cmul(p.u7.zw, a3);
+
+    psi[i0] = pack2x16float(r0);
+    psi[i1] = pack2x16float(r1);
+    psi[i2] = pack2x16float(r2);
+    psi[i3] = pack2x16float(r3);
+}
+"#;
+
 /// Vetor de estado de `n` qubits, residente na GPU.
 pub struct Estado {
     qubits: usize,
     precisao: Precisao,
     buf: wgpu::Buffer,
     pipeline: wgpu::ComputePipeline,
+    pipeline2: wgpu::ComputePipeline,
 }
 
 impl Estado {
@@ -346,7 +531,26 @@ impl Estado {
                 cache: None,
             });
 
-        Ok(Estado { qubits, precisao, buf, pipeline })
+        let fonte2 = match precisao {
+            Precisao::F32 => PORTA2,
+            Precisao::F16 => PORTA2_F16,
+        };
+        let modulo2 = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("porta2"),
+            source: wgpu::ShaderSource::Wgsl(fonte2.into()),
+        });
+        let pipeline2 = gpu
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("porta2"),
+                layout: None,
+                module: &modulo2,
+                entry_point: Some("porta2"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Ok(Estado { qubits, precisao, buf, pipeline, pipeline2 })
     }
 
     pub fn qubits(&self) -> usize {
@@ -409,6 +613,68 @@ impl Estado {
             timestamp_writes: None,
         });
         passe.set_pipeline(&self.pipeline);
+        passe.set_bind_group(0, &bind, &[]);
+        passe.dispatch_workgroups(gx, gy, 1);
+    }
+
+    /// Grava a aplicação de uma porta de dois qubits. Não sincroniza.
+    ///
+    /// A base é ordenada por `2·b₁ + b₀`: para um CNOT, `q1` é o controle e
+    /// `q0` o alvo. Os dois precisam ser distintos; a ordem entre eles é livre.
+    ///
+    /// O tráfego é o mesmo de uma porta de um qubit — cada amplitude é lida e
+    /// reescrita uma vez —, mas a aritmética é quatro vezes maior: 16
+    /// multiplicações complexas por grupo contra 4 por par.
+    pub fn aplicar2(
+        &self,
+        gpu: &Gpu,
+        enc: &mut wgpu::CommandEncoder,
+        porta: &Porta2,
+        q0: usize,
+        q1: usize,
+    ) {
+        assert!(q0 < self.qubits && q1 < self.qubits, "qubit fora de {}", self.qubits);
+        assert_ne!(q0, q1, "uma porta de dois qubits precisa de dois qubits distintos");
+
+        let grupos = self.amplitudes() / 4;
+        let blocos = grupos.div_ceil(256);
+        let (gx, gy) = if blocos <= 32768 {
+            (blocos as u32, 1u32)
+        } else {
+            (32768, blocos.div_ceil(32768) as u32)
+        };
+
+        let mut u = [0.0f32; 32];
+        for linha in 0..4 {
+            for col in 0..4 {
+                u[linha * 8 + col * 2] = porta.u[linha][col].0;
+                u[linha * 8 + col * 2 + 1] = porta.u[linha][col].1;
+            }
+        }
+        let params = Porta2P { grupos: grupos as u32, q0: q0 as u32, q1: q1 as u32, gx, u };
+
+        let uniforme = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("porta2"),
+            size: std::mem::size_of::<Porta2P>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue().write_buffer(&uniforme, 0, bytemuck::bytes_of(&params));
+
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipeline2.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforme.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.buf.as_entire_binding() },
+            ],
+        });
+
+        let mut passe = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("porta2"),
+            timestamp_writes: None,
+        });
+        passe.set_pipeline(&self.pipeline2);
         passe.set_bind_group(0, &bind, &[]);
         passe.dispatch_workgroups(gx, gy, 1);
     }

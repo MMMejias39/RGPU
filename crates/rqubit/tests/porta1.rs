@@ -172,3 +172,101 @@ fn meia_precisao_alcanca_mais_qubits() {
     assert_eq!(Precisao::F16.max_qubits(), 28);
     assert_eq!(Precisao::F16.bytes_por_amplitude(), 4);
 }
+
+/// CNOT sobre |10⟩ tem de dar |11⟩, e sobre |00⟩ não fazer nada.
+#[test]
+fn cnot_nega_o_alvo_quando_o_controle_e_um() {
+    use rqubit::Porta2;
+    let Some(gpu) = abrir() else { return };
+    let estado = Estado::novo(&gpu, 3).expect("estado");
+
+    // X no qubit 1 leva |000⟩ a |010⟩; CNOT com controle 1 e alvo 0 dá |011⟩.
+    let mut enc = gpu.encoder();
+    estado.aplicar(&gpu, &mut enc, &Porta1::x(), 1);
+    estado.aplicar2(&gpu, &mut enc, &Porta2::cnot(), 0, 1);
+    gpu.submit(enc);
+
+    let psi = estado.baixar(&gpu);
+    assert!((psi[3].0 - 1.0).abs() < 1e-6, "esperado |011⟩, veio índice 3 = {:?}", psi[3]);
+    for (i, a) in psi.iter().enumerate() {
+        if i != 3 {
+            assert!(a.0.abs() < 1e-6 && a.1.abs() < 1e-6, "índice {i} não nulo: {a:?}");
+        }
+    }
+}
+
+/// Hadamard seguido de CNOT produz o estado de Bell: |00⟩ e |11⟩ com amplitude
+/// 1/√2, e nada nos estados intermediários. É o teste que só passa se o
+/// emaranhamento estiver certo.
+#[test]
+fn produz_estado_de_bell() {
+    use rqubit::Porta2;
+    let Some(gpu) = abrir() else { return };
+    let estado = Estado::novo(&gpu, 2).expect("estado");
+
+    let mut enc = gpu.encoder();
+    estado.aplicar(&gpu, &mut enc, &Porta1::hadamard(), 1);
+    estado.aplicar2(&gpu, &mut enc, &Porta2::cnot(), 0, 1);
+    gpu.submit(enc);
+
+    let psi = estado.baixar(&gpu);
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    assert!((psi[0].0 - s).abs() < 1e-6, "|00⟩ = {:?}", psi[0]);
+    assert!(psi[1].0.abs() < 1e-6, "|01⟩ deveria ser zero: {:?}", psi[1]);
+    assert!(psi[2].0.abs() < 1e-6, "|10⟩ deveria ser zero: {:?}", psi[2]);
+    assert!((psi[3].0 - s).abs() < 1e-6, "|11⟩ = {:?}", psi[3]);
+}
+
+/// Circuito com portas de um e dois qubits, em todas as combinações de posição,
+/// conferido contra a CPU.
+#[test]
+fn circuito_de_duas_portas_bate_com_a_cpu() {
+    use rqubit::Porta2;
+    let Some(gpu) = abrir() else { return };
+    const N: usize = 10;
+
+    let estado = Estado::novo(&gpu, N).expect("estado");
+    let mut cpu = estado_inicial_cpu(N);
+    let portas2 = [Porta2::cnot(), Porta2::cz(), Porta2::swap()];
+
+    let mut enc = gpu.encoder();
+    for q in 0..N {
+        let p = Porta1::ry(0.3 + q as f32 * 0.11);
+        estado.aplicar(&gpu, &mut enc, &p, q);
+        p.aplicar_cpu(&mut cpu, q);
+    }
+    // Pares vizinhos, distantes e invertidos — todas as relações de posição.
+    for (i, (q0, q1)) in [(0, 1), (2, 5), (9, 3), (4, 8), (7, 6)].iter().enumerate() {
+        let p = portas2[i % 3];
+        estado.aplicar2(&gpu, &mut enc, &p, *q0, *q1);
+        p.aplicar_cpu(&mut cpu, *q0, *q1);
+    }
+    gpu.submit(enc);
+
+    let psi = estado.baixar(&gpu);
+    let e = erro_max(&cpu, &psi);
+    eprintln!("{N} qubits, 10 portas de 1 + 5 de 2: erro {e:.2e}, norma {:.6}", norma(&psi));
+    assert!(e < 1e-5, "erro máximo {e:.2e}");
+    assert!((norma(&psi) - 1.0).abs() < 1e-4);
+}
+
+#[test]
+fn swap_e_a_propria_inversa() {
+    use rqubit::Porta2;
+    let Some(gpu) = abrir() else { return };
+    let estado = Estado::novo(&gpu, 6).expect("estado");
+    let mut cpu = estado_inicial_cpu(6);
+
+    let mut enc = gpu.encoder();
+    for q in 0..6 {
+        let p = Porta1::ry(0.5 + q as f32 * 0.2);
+        estado.aplicar(&gpu, &mut enc, &p, q);
+        p.aplicar_cpu(&mut cpu, q);
+    }
+    // Dois SWAPs iguais devolvem o estado ao que era.
+    estado.aplicar2(&gpu, &mut enc, &Porta2::swap(), 1, 4);
+    estado.aplicar2(&gpu, &mut enc, &Porta2::swap(), 1, 4);
+    gpu.submit(enc);
+
+    assert!(erro_max(&cpu, &estado.baixar(&gpu)) < 1e-6);
+}

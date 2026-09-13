@@ -10,7 +10,7 @@ Metal, DX12 ou WebGPU, então o mesmo código roda em NVIDIA, AMD, Intel e Apple
 |---|---|
 | [`rtensor`](crates/rtensor) | Framework de deep learning: tensor com broadcasting, autodiff reverso, camadas, otimizadores e backend de GPU |
 | [`rgpu-power`](crates/rgpu-power) | Medição de energia: potência da GPU por `nvidia-smi`, energia da CPU e da GPU integrada por RAPL |
-| [`rqubit`](crates/rqubit) | Simulador de vetor de estado quântico, com medição de energia por porta |
+| [`rqubit`](crates/rqubit) | Simulador de vetor de estado quântico: portas de 1 e 2 qubits, com medição de energia |
 
 ## Desempenho
 
@@ -220,6 +220,10 @@ estado dentro de 0,2% de 1.
 O teto de qubits não é de VRAM: o WebGPU limita um binding a 2 GB **menos 4
 bytes**. Isso dá 27 qubits em `f32` e 28 em `f16` — meia precisão compra **um**
 qubit, não dois, porque o teto também é potência de dois.
+
+Portas de **um e dois qubits** — Hadamard, Pauli-X/Z, rotação Y, fase, CNOT, CZ
+e SWAP — o suficiente para circuitos universais. Conferidas contra referência de
+CPU, incluindo o estado de Bell, que só passa se o emaranhamento estiver certo.
 
 Nenhum simulador existente — Qiskit Aer, cuQuantum, qsim — publica joules por
 porta. Aqui isso sai de graça, porque o instrumento já existe.
