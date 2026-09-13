@@ -124,14 +124,23 @@ teto de ~5 TFLOP/s que estamos encostando.
 ## O que resta
 
 A matriz cooperativa era a última técnica da lista e a que o diagnóstico
-revisado indicava. Foi testada e **não funciona** nesta combinação de wgpu,
-naga e driver — compila e executa, mas devolve zeros. E exige `unsafe`, o que
-custaria uma das propriedades declaradas do projeto. Detalhes em
-[RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+revisado indicava. O registro anterior dizia **não funciona**; o diagnóstico
+estava errado: a sonda fixava `8×8 f32`, configuração que a placa não anuncia —
+comportamento indefinido, e os zeros vinham daí. Nas configurações anunciadas
+(`16×16`, operandos `f16`), a cadeia inteira funciona com erro zero, inclusive
+com estagiagem em memória de workgroup (`examples/probe_coop_f16.rs`). Restam
+dois preços: `ExperimentalFeatures::enabled()` é `unsafe fn` — custaria a
+propriedade "zero `unsafe`" do projeto — e os tensor cores desta placa só
+aceitam operandos em `f16`. O veredito numérico já existe: o kernel GEMM
+cooperativo (`examples/bench_coop.rs`) mede **5.756–5.988 GFLOP/s em 4096³**
+contra 3.804–4.243 do escalar — **+37% a +50%** — e empata em 2048³. Pagar os
+dois preços (`unsafe` e `f16`) por isso é uma decisão que agora tem número.
+Detalhes em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
 
-Com isso o roteiro está esgotado dentro do que o WGSL oferece hoje. O GEMM ficou
-em ~4.300 GFLOP/s, ou ~4.900 com Strassen acima de 4096³, contra 3.290 no
-início — **+33% a +49%**.
+O roteiro clássico está esgotado dentro do WGSL padrão — o GEMM ficou em
+~4.300 GFLOP/s, ou ~4.900 com Strassen acima de 4096³, contra 3.290 no início,
+**+33% a +49%**. O que resta fora do padrão é o caminho experimental dos tensor
+cores, agora funcional e esperando medição.
 
 ## O saldo
 

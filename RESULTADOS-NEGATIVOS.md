@@ -45,7 +45,7 @@ negativo tem lugar neste repositório.
 | Fusão em 4 qubits, kernel **especializado** | **7,65×** em tempo, 5,64× em energia | em produção |
 | Precisão mista `f16`/`f32` | **+1 a 7%** de velocidade, **−5 a 11%** de energia | mantida por outra razão |
 | Bloco `8×4` por thread | **nulo** | [revertido](experimentos/gemm-8x4/) |
-| Matriz cooperativa (tensor cores) | **não funcional** e exige `unsafe` | sonda mantida |
+| Matriz cooperativa (tensor cores) | o "não funcional" era diagnóstico errado: **funciona** nas configurações anunciadas; exige `unsafe` e operandos `f16` | sondas mantidas |
 
 ### Bloco 8×8 por thread — rejeitado
 
@@ -66,33 +66,94 @@ O kernel está preservado em [`experimentos/gemm-8x8/`](experimentos/gemm-8x8/)
 para que a tentativa não precise ser refeita, e para que quem discordar da
 conclusão possa medir por conta própria.
 
-### Matriz cooperativa — não funcional, e cobra `unsafe`
+### Matriz cooperativa — o diagnóstico "não funciona" estava errado
 
 Era a última técnica da lista e a que a análise apontava: uma instrução cobrindo
 um ladrilho inteiro reduziria de uma vez as leituras compartilhadas **e** as
 FMAs, que é o que o diagnóstico revisado indica ser necessário.
 
-`crates/rtensor/examples/probe_coop.rs` testou, em wgpu 30.0.1, naga 30.0.1,
-driver NVIDIA 595.91.07.
+**Primeira medição, retificada.** `crates/rtensor/examples/probe_coop.rs`
+testou, em wgpu 30.0.1, naga 30.0.1, driver NVIDIA 595.91.07, e devolveu zeros.
+Foi registrada como não funcional. O registro estava errado em três pontos:
 
-**Funciona:** o adaptador anuncia `EXPERIMENTAL_COOPERATIVE_MATRIX`; o
-dispositivo aceita a feature; o WGSL compila com `enable
-wgpu_cooperative_matrix;`, os tipos `coop_mat8x8<f32, A|B|C>` e as funções
-`coopLoad`, `coopMultiplyAdd`, `coopStore`; o kernel executa e o `coopStore`
-escreve de fato — verificado com uma marca de vida em `c[63]`, que é
-sobrescrita.
+1. **A configuração não existe nesta placa.** A sonda fixou `8×8 f32` sem
+   consultar `Adapter::cooperative_matrix_properties()`. O RTX 4070 Laptop
+   anuncia só combinações com `f16` em A e B — `16×16×16`, `16×8×16` e
+   `16×8×8`, com acumulador `f16` ou `f32`. Configuração fora da lista é
+   comportamento indefinido; o driver respondeu com zeros.
+2. **Layout trocado.** A sonda usava `coopLoad`, que lê **column-major**
+   segundo a especificação que o wgpu hoje publica
+   (`docs/api-specs/cooperative_matrix.md` no repositório deles), sobre dados
+   em row-major.
+3. **A "marca de vida" não provava nada.** O doc afirmava que o `coopStore`
+   escrevia — verificado com uma marca em `c[63]` — mas o código comitado
+   inicializava tudo com zero: `c[63] = 0` não distinguia "escreveu zero" de
+   "não escreveu".
 
-**Não funciona:** o resultado é zero. Testado com ponteiros para buffer de
-armazenamento e para memória de workgroup, com passo explícito. Não há
-especificação publicada da semântica de ponteiro e passo.
+**Segunda medição, que retifica a primeira**
+(`crates/rtensor/examples/probe_coop_f16.rs`). Nas configurações anunciadas —
+`16×16×16` com AB `f16` e acumulador `f32` (misto) ou `f16` — oito variantes do
+mesmo produto 16×16 conferido contra a referência de CPU, **todas com erro
+máximo zero**:
 
-**E há um segundo preço:** habilitar a feature exige
-`ExperimentalFeatures::enabled()`, que é **`unsafe fn`** — o wgpu declara que
-estas APIs podem conter bugs que levam a comportamento indefinido a partir de
-código seguro. Adotá-la custaria a propriedade "zero `unsafe`" do projeto.
+| Ponteiros | Leitura | Workgroup | C `f32` | C `f16` |
+|---|---|---|---|---|
+| buffer de armazenamento | `coopLoadT` | 32 | correto | correto |
+| buffer de armazenamento | `coopLoadT` | 256 | correto | correto |
+| memória de workgroup | `coopLoadT` | 32 | correto | correto |
+| memória de workgroup | `coopLoadT` | 256 | correto | correto |
 
-Mesmo que funcionasse, essa troca mereceria discussão. Não funcionando, a
-decisão é simples: adiar. A sonda fica como caso de reprodução.
+O caminho que um GEMM real usaria — estagiagem em memória de workgroup, com
+workgroup de 32 (um subgrupo) ou 256 (oito) threads — funciona. O naga emite
+as matrizes com escopo `Subgroup`, e o subgrupo da NVIDIA é 32. A escada de
+diagnóstico da sonda (produto + marca, produto puro, só marca, zero) separa
+falta de carga, falta de soma e falta de escrita; a cadeia inteira passou.
+
+**O que resta de preço — dois, e agora são os únicos:**
+
+1. **`unsafe`.** Habilitar a feature exige `ExperimentalFeatures::enabled()`,
+   que é `unsafe fn` — o wgpu declara que estas APIs podem conter bugs que
+   levam a comportamento indefinido a partir de código aparentemente seguro.
+   A propriedade "zero `unsafe`" do projeto continua em jogo.
+2. **Operandos em `f16`.** Todas as configurações anunciadas exigem `f16` em A
+   e B — não há caminho com operandos `f32` nesta placa. É o regime da
+   precisão mista, medido acima como sem ganho no GEMM convencional; com
+   tensor cores a taxa de aritmética muda de base, e a conta precisa ser
+   refeita.
+
+**Medido: o kernel GEMM cooperativo** (`crates/rtensor/examples/bench_coop.rs`)
+— ladrilho de saída 64×64 por workgroup de 256 threads (8 subgrupos), dois
+ladrilhos cooperativos de 16×16 por subgrupo, `K` em passos de 16 com
+estagiagem em memória de workgroup, acumuladores residentes entre os passos.
+Mediana de 8 execuções, conferido contra referência em f64 sobre os operandos
+já em `f16` (bloco 32×32 amostral, 0 posições erradas):
+
+| `N` | cooperativo | escalar | ganho |
+|---|---:|---:|---:|
+| 2048³ | 4.369–4.466 | 4.386 | **par** |
+| 4096³ | 5.756–5.988 | 3.804–4.243 | **+37% a +50%** |
+
+Dois achados no caminho, ambos com registro:
+
+- **Bug do naga 30.0.1.** `coopLoad`/`coopStore` com ponteiro dinâmico para
+  buffer de **armazenamento** derrubam o compilador SPIR-V —
+  `internal error: Expression is not cached!` em `back/spv/index.rs`. Ponteiro
+  dinâmico para memória de workgroup compila e executa. O contorno: os
+  ladrilhos de C saem e entram por slots de workgroup em base fixa por
+  subgrupo, com cópias planas (que não tocam no bug) para o buffer de saída.
+  Custo do contorno: ~6% contra o caminho direto (5.988 contra 6.364).
+- **Artefato de medição meu.** Na primeira medição com armazenamento fixo, o
+  laço de `K` ainda estava com um passo só (resto do bissecionamento) e a
+  fórmula de GFLOP/s dividiu pelo trabalho completo: deu "21 TFLOP/s", número
+  sem sentido. A comparação só ficou honesta com o laço inteiro — o mesmo tipo
+  de erro da especialização alinhada, registrado acima.
+
+O ganho em 4096³ vai além do que a banda explica: a precisão mista sozinha
+rendera +1 a 7% no kernel escalar, e aqui são ~40% — os tensor cores estão
+somando aritmética real. O primeiro corte não tem buffer duplo nem rasterização
+de L2 (o escalar tem ambos); com eles, o teto do desenho comum é a próxima
+medida. O `probe_coop.rs` fica como registro do diagnóstico original e o
+`probe_coop_f16.rs` como prova do funcionamento.
 
 ### GEMM especializado para formas alinhadas — sem efeito
 
@@ -154,7 +215,7 @@ banco rendeu 28% — nenhum dos dois isoladamente domina.
 
 Se isso estiver certo, o caminho restante é reduzir as **duas de uma vez**, que
 é o que a instrução de matriz cooperativa faz: um ladrilho inteiro por
-instrução. É a única técnica da lista ainda não tentada, e a placa a oferece.
+instrução. Depois de testada (ver a seção da matriz cooperativa): a placa a oferece e ela funciona nas configurações anunciadas — restam os preços do `unsafe` e do `f16`.
 
 ### Fusão em unitárias maiores — implementada, e mais lenta
 
@@ -297,6 +358,18 @@ carga. Uma janela de 0,42 s leu energia zero acima da ociosidade. A janela agora
 ### Dividir por energia nula não dá eficiência infinita
 
 Dá medição falha. Hoje é descartada.
+
+### A referência de `f16` do `rqubit` devolvia metade dos subnormais
+
+A conversão `f16 → f32` escrita à mão no `rqubit` — para manter a crate sem
+dependências — normalizava subnormais com um expoente a mais no laço: `0x0001`
+virava 2⁻²⁵ em vez de 2⁻²⁴, metade do valor, em todos os subnormais. Achado por
+ocasião da sonda da matriz cooperativa, cuja referência de CPU ia copiar a
+função; conferido contra a crate `half` num projeto descartável fora do
+repositório. Corrigido com os valores fixados em teste unitário
+(`crates/rqubit/src/lib.rs`); a suíte inteira segue verde. Amplitudes quânticas
+podem ser subnormais, e a referência de CPU é o árbitro dos kernels — os testes
+existentes não pegaram porque as amplitudes deles eram todas normais.
 
 ## Limites de hardware encontrados
 
