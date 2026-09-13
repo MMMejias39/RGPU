@@ -38,6 +38,7 @@ negativo tem lugar neste repositório.
 | Strassen de um nível | **+11 a 13%** acima de 4096³, **−52%** em 1024³ | opcional |
 | Split-K | **+12,6× a 21,4×** em formas K-dominantes | opcional |
 | Precisão mista `f16`/`f32` | **+1 a 7%** de velocidade, **−5 a 11%** de energia | mantida por outra razão |
+| Bloco `8×4` por thread | **nulo** | [revertido](experimentos/gemm-8x4/) |
 
 ### Bloco 8×8 por thread — rejeitado
 
@@ -57,6 +58,31 @@ ULAs, o gargalo não é intensidade aritmética — dobrá-la só custa ocupaç�
 O kernel está preservado em [`experimentos/gemm-8x8/`](experimentos/gemm-8x8/)
 para que a tentativa não precise ser refeita, e para que quem discordar da
 conclusão possa medir por conta própria.
+
+### Bloco 8×4 — rejeitado, e contraria o diagnóstico
+
+Ladrilho retangular 128×64, 8 acumuladores `vec4` com índices constantes. Lê 48
+bytes por 32 FMAs: **1,33 flop por byte** contra 1,0 do bloco `4×4`. Passou nas
+63 combinações de conferência. E mediu neutro:
+
+```
+2048³   4×4: 4242 / 4277 / 4202     8×4: 4200 / 4271 / 4241
+4096³   4×4: 4195 / 4243            8×4: 4202 / 4253
+```
+
+Isso **contraria a previsão feita a partir da sonda de banda compartilhada**,
+que indicava teto de ~5 TFLOP/s com 1 flop/byte e ~6,7 com 1,33. Não é
+ocupação: o `8×4` usa *menos* memória compartilhada, 12 KB contra 16 KB.
+
+A leitura mais consistente com todos os dados é que o laço interno satura a
+**vazão de instruções** do conjunto leitura-compartilhada + FMA, e mudar a
+proporção entre as duas não ajuda porque ambas estão perto do limite. Na mesma
+sonda, remover 7/8 das multiplicações rendeu 17% e eliminar os conflitos de
+banco rendeu 28% — nenhum dos dois isoladamente domina.
+
+Se isso estiver certo, o caminho restante é reduzir as **duas de uma vez**, que
+é o que a instrução de matriz cooperativa faz: um ladrilho inteiro por
+instrução. É a única técnica da lista ainda não tentada, e a placa a oferece.
 
 ### Precisão mista — não é ganho de velocidade nem de energia
 
@@ -195,8 +221,9 @@ Três leituras deste resultado:
 1. **A sonda reproduz o GEMM.** 3.975 GFLOP/s contra os 4.300 do GEMM real. O
    laço interno com suas leituras compartilhadas *é* o gargalo, isolado.
 2. **Não é aritmética.** Remover 7/8 das multiplicações rende 14%.
-3. **É o canal de memória compartilhada.** Estamos a 78% do teto sem conflito
-   (3,98 de 5,10 TB/s), e o conflito de banco custa os 21% restantes.
+3. **É o canal de memória compartilhada** — foi a conclusão na época, e o
+   bloco `8×4` depois a enfraqueceu: aumentar a intensidade de 1,0 para 1,33
+   flop/byte não rendeu nada. A leitura revisada está na seção do `8×4`.
 
 O laço interno lê 32 bytes da memória compartilhada por 32 flops — **1 flop por
 byte**. Com o canal saturando em ~5 TB/s, o teto é ~5 TFLOP/s, e estamos a 4,3.
