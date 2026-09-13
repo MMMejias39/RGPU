@@ -14,9 +14,13 @@ qubits = int(sys.argv[1]) if len(sys.argv) > 1 else 24
 camadas = int(sys.argv[2]) if len(sys.argv) > 2 else 4
 fusao = (sys.argv[3].lower() == "on") if len(sys.argv) > 3 else True
 precisao = sys.argv[4] if len(sys.argv) > 4 else "single"
+# Limite de qubits por unitária fundida. O padrão do Aer é 5; varremos para dar
+# a ele a mesma chance de ajuste que damos ao rqubit.
+max_fundido = int(sys.argv[5]) if len(sys.argv) > 5 else 5
 
 sim = AerSimulator(
-    method="statevector", device="CPU", fusion_enable=fusao, precision=precisao
+    method="statevector", device="CPU", fusion_enable=fusao,
+    precision=precisao, fusion_max_qubit=max_fundido,
 )
 
 qc = QuantumCircuit(qubits)
@@ -37,6 +41,6 @@ sim.run(qc, shots=1).result()
 dt = time.perf_counter() - t0
 
 print(
-    "motor=aer-CPU|prec=%s|fusao=%s|qubits=%d|camadas=%d|portas=%d|ms=%.3f"
-    % (precisao, "on" if fusao else "off", qubits, camadas, portas, dt * 1e3)
+    "motor=aer-CPU|prec=%s|fusao=%s|max=%d|qubits=%d|portas=%d|ms=%.3f"
+    % (precisao, "on" if fusao else "off", max_fundido, qubits, portas, dt * 1e3)
 )

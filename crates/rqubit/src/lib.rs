@@ -479,6 +479,8 @@ pub struct Estado {
     pipeline_n: wgpu::ComputePipeline,
     pipeline3: wgpu::ComputePipeline,
     pipeline4: wgpu::ComputePipeline,
+    pipeline5: wgpu::ComputePipeline,
+    pipeline6: wgpu::ComputePipeline,
 }
 
 impl Estado {
@@ -601,6 +603,24 @@ impl Estado {
                 cache: None,
             });
 
+        let mut especializado = |fonte: &str, entrada: &str| {
+            let m = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(entrada),
+                source: wgpu::ShaderSource::Wgsl(fonte.into()),
+            });
+            gpu.device()
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entrada),
+                    layout: None,
+                    module: &m,
+                    entry_point: Some(entrada),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let pipeline5 = especializado(porta_n::PORTA5, "porta5");
+        let pipeline6 = especializado(porta_n::PORTA6, "porta6");
+
         Ok(Estado {
             qubits,
             precisao,
@@ -610,6 +630,8 @@ impl Estado {
             pipeline_n,
             pipeline3,
             pipeline4,
+            pipeline5,
+            pipeline6,
         })
     }
 
@@ -970,6 +992,9 @@ impl Estado {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+/// Espelha exatamente o `struct P` dos kernels: quatro `vec4` alternando
+/// alvos e ordenados. Dois arrays de 8 **não** serviriam — o shader intercala,
+/// e o desencontro produz resultado errado sem erro de validação.
 struct PortaNP {
     grupos: u32,
     n: u32,
@@ -977,6 +1002,8 @@ struct PortaNP {
     pad: u32,
     alvos: [u32; 4],
     ordenados: [u32; 4],
+    alvos2: [u32; 4],
+    ordenados2: [u32; 4],
 }
 
 impl Estado {
@@ -985,6 +1012,8 @@ impl Estado {
         match k {
             3 => &self.pipeline3,
             4 => &self.pipeline4,
+            5 => &self.pipeline5,
+            6 => &self.pipeline6,
             _ => &self.pipeline_n,
         }
     }
@@ -992,13 +1021,13 @@ impl Estado {
     /// Grava uma porta de `N` qubits, com `N` até 4.
     pub fn aplicar_n(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, porta: &PortaN) {
         let k = porta.alvos.len();
-        assert!((1..=4).contains(&k), "porta de {k} qubits fora da faixa 1..=4");
+        assert!((1..=6).contains(&k), "porta de {k} qubits fora da faixa 1..=6");
         assert!(porta.alvos.iter().all(|q| *q < self.qubits));
         assert_eq!(self.precisao, Precisao::F32, "kernel de N qubits só em f32");
 
         // 3 e 4 qubits têm kernel próprio; o genérico não é mais usado no
         // caminho padrão, e fica como referência e caso de comparação.
-        let especializado = k == 3 || k == 4;
+        let especializado = (3..=6).contains(&k);
         let grupos = self.amplitudes() >> k;
         let blocos = grupos.div_ceil(if especializado { 256 } else { 64 });
         let (gx, gy) = if blocos <= 32768 {
@@ -1007,24 +1036,29 @@ impl Estado {
             (32768, blocos.div_ceil(32768) as u32)
         };
 
-        let mut alvos = [0u32; 4];
+        let mut alvos = [0u32; 8];
         for (i, q) in porta.alvos.iter().enumerate() {
             alvos[i] = *q as u32;
         }
         let mut ordenados = porta.alvos.clone();
         ordenados.sort_unstable();
-        let mut ord = [0u32; 4];
+        let mut ord = [0u32; 8];
         for (i, q) in ordenados.iter().enumerate() {
             ord[i] = *q as u32;
         }
+        let quatro = |v: &[u32; 8], desde: usize| -> [u32; 4] {
+            [v[desde], v[desde + 1], v[desde + 2], v[desde + 3]]
+        };
 
         let params = PortaNP {
             grupos: grupos as u32,
             n: k as u32,
             gx,
             pad: 0,
-            alvos,
-            ordenados: ord,
+            alvos: quatro(&alvos, 0),
+            ordenados: quatro(&ord, 0),
+            alvos2: quatro(&alvos, 4),
+            ordenados2: quatro(&ord, 4),
         };
         let uniforme = gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("porta_n"),
@@ -1072,7 +1106,7 @@ impl Circuito {
     /// pode ser fundida na última pendente que couber — o que empacota portas
     /// disjuntas numa passada só.
     pub fn fundir_ate(&self, max_qubits: usize) -> Vec<PortaN> {
-        assert!((1..=4).contains(&max_qubits));
+        assert!((1..=6).contains(&max_qubits));
         let mut pendentes: Vec<PortaN> = Vec::new();
 
         for op in &self.ops {

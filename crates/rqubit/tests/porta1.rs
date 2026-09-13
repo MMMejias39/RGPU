@@ -371,7 +371,7 @@ fn fusao_maior_preserva_o_estado() {
     gpu.submit(enc);
     let esperado = referencia.baixar(&gpu);
 
-    for max in 2..=4usize {
+    for max in 2..=6usize {
         let estado = Estado::novo(&gpu, N).expect("estado");
         let mut enc = gpu.encoder();
         let n = estado.aplicar_circuito_fundido(&gpu, &mut enc, &circuito, max);

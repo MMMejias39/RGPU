@@ -44,7 +44,7 @@ fn main() {
         "qubits", "portas", "máx.", "fundidas", "ms", "ganho", "energia"
     );
 
-    for qubits in [22usize, 24, 26] {
+    for qubits in [24usize, 26] {
         let c = circuito(qubits, camadas);
         let estado = Estado::novo_com(&gpu, qubits, Precisao::F32).expect("estado");
 
@@ -83,7 +83,7 @@ fn main() {
             "{:>7} {:>8} {:>7} {:>9} {:>11.3} {:>9} {:>13}",
             qubits, n_base, "—", n_base, t_base * 1e3, "(base)", "(base)"
         );
-        for max in 2..=4usize {
+        for max in 2..=6usize {
             let (t, n, j) = medir(max);
             let energia = match (j_base, j) {
                 (Some(a), Some(b)) if b > 1e-9 => format!("{:.2}× menos", a / b),

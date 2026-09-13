@@ -282,22 +282,34 @@ threads em vez de 256 e percorre a matriz com laços de limite variável.
 Kernels **especializados**, com as amplitudes em registradores e os elementos
 da matriz endereçados por índices literais, invertem o resultado:
 
-| Máx. qubits | Portas | Genérico | Especializado | Ganho | Energia |
+Foram gerados kernels especializados para 3, 4, 5 e 6 qubits. Circuito de 4
+camadas em 26 qubits:
+
+| Máx. qubits | Portas | ms | Ganho | Energia | Amplitudes em registrador |
 |---:|---:|---:|---:|---:|---:|
-| — | 308 | — | 1.558 ms | (base) | (base) |
-| 2 | 112 | 545 ms | 566 ms | 2,75× | 2,68× menos |
-| 3 | 58 | 595 ms | 294 ms | 5,30× | 4,63× menos |
-| **4** | **40** | 690 ms | **204 ms** | **7,65×** | **5,64× menos** |
+| — | 308 | 1.540 | (base) | (base) | — |
+| 2 | 112 | 561,8 | 2,74× | 2,68× menos | 8 floats |
+| 3 | 58 | 289,0 | 5,33× | 4,62× menos | 16 floats |
+| 4 | 40 | 201,8 | 7,63× | 5,65× menos | 32 floats |
+| **5** | **30** | **154,8** | **9,95×** | **6,46× menos** | **64 floats** |
+| 6 | 24 | 303,6 | 5,07× | 4,86× menos | 128 floats |
 
-308 portas contra 40 são **7,70× menos passadas** para **7,65× menos tempo** —
-proporcional até o segundo decimal, que é o que se espera quando o limite é
-banda e o kernel não está handicapado.
+**O pico é em 5 qubits, e o limite não é a placa — é pressão de registradores.**
+Em 6 qubits são 64 amplitudes complexas, 128 floats vivos por thread, e a
+ocupação desaba: 20% menos portas e o dobro do tempo. A sonda
+`rtensor/examples/ocupacao.rs` tinha medido que a vazão se sustenta até ~96
+floats e cai depois; o precipício está entre 64 e 128, e aqui ele aparece de
+novo num domínio completamente diferente.
 
-O ganho de energia fica em 5,64×, abaixo dos 7,65× de tempo. A diferença tem
-causa conhecida: uma porta de 4 qubits faz **8× mais aritmética por amplitude**
-que uma de 1 qubit. Numa carga limitada por banda isso não custa relógio — e
-custa watt, exatamente como na porta de dois qubits, onde 4× a aritmética saiu
-de graça no tempo e cobrou 7% na energia.
+Até o pico, o ganho acompanha a redução de portas quase exatamente — 308 contra
+30 são 10,3× menos passadas para 9,95× menos tempo. É o comportamento de uma
+carga limitada por banda.
+
+O ganho de energia fica sempre **abaixo** do de tempo, e a distância cresce com
+`N`. Causa conhecida: uma porta de `N` qubits faz `2ᴺ⁻¹×` mais aritmética por
+amplitude que uma de 1 qubit. Numa carga limitada por banda isso não custa
+relógio — e custa watt, como já se via na porta de dois qubits, onde 4× a
+aritmética saiu de graça no tempo e cobrou 7% na energia.
 
 ### Contra o Qiskit Aer e o cuQuantum
 
@@ -366,6 +378,25 @@ GPU limitada por banda ganha sempre.
 
 **Contra o Aer, 8,0× em 26 qubits** — mas é GPU contra CPU, e isso era
 esperado.
+
+### Com a fusão até 5 qubits
+
+Refeita a comparação com o melhor de cada um, em 26 qubits:
+
+| Motor | ms |
+|---|---:|
+| **rqubit, fusão até 5 qubits** | **154,8** |
+| cuStateVec (sem fusão na API) | 1.272 |
+| rqubit sem fusão | 1.540 |
+| Aer, melhor limite de fusão (5) | 3.806 |
+| Aer sem fusão | 6.165 |
+
+**8,2× mais rápido que o cuStateVec e 24,6× que o Aer** — com a ressalva já
+registrada de que o cuStateVec é API de baixo nível e a NVIDIA tem camadas
+superiores que fundiriam, e de que o Aer é CPU.
+
+Ao Aer foi dada a mesma chance de ajuste: varrendo o limite de fusão dele de 2 a
+5, o melhor foi 5, com 1,62× sobre o próprio caso sem fusão.
 
 Duas armadilhas que invalidariam a comparação, e como foram tratadas, estão em
 [`benchmarks/quantum/`](benchmarks/quantum/): portas que se cancelam no
