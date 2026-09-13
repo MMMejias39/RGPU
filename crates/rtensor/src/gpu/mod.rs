@@ -97,6 +97,7 @@ enum Kernel {
     MmF,
     MmAtbF,
     MmAbtF,
+    MmBias,
     BiasAdd,
     Relu,
     ReluBwd,
@@ -160,6 +161,7 @@ pub struct Gpu {
     mm_f: wgpu::ComputePipeline,
     mm_atb_f: wgpu::ComputePipeline,
     mm_abt_f: wgpu::ComputePipeline,
+    mm_bias: wgpu::ComputePipeline,
     bias_add: wgpu::ComputePipeline,
     relu: wgpu::ComputePipeline,
     relu_bwd: wgpu::ComputePipeline,
@@ -299,6 +301,7 @@ impl Gpu {
             mm_f: pipe(gemm::MM_FAST, "mm", "mm_fast"),
             mm_atb_f: pipe(gemm::MM_FAST, "mm_atb", "mm_atb_fast"),
             mm_abt_f: pipe(gemm::MM_FAST, "mm_abt", "mm_abt_fast"),
+            mm_bias: pipe(gemm::MM_EPILOGO, "mm_bias", "mm_bias"),
             bias_add: pipe(kernels::VEC, "bias_add", "bias_add"),
             relu: pipe(kernels::VEC, "relu", "relu"),
             relu_bwd: pipe(kernels::RELU_BWD, "relu_bwd", "relu_bwd"),
@@ -345,6 +348,7 @@ impl Gpu {
             Kernel::MmF => &self.mm_f,
             Kernel::MmAtbF => &self.mm_atb_f,
             Kernel::MmAbtF => &self.mm_abt_f,
+            Kernel::MmBias => &self.mm_bias,
             Kernel::BiasAdd => &self.bias_add,
             Kernel::Relu => &self.relu,
             Kernel::ReluBwd => &self.relu_bwd,
@@ -557,6 +561,34 @@ impl Gpu {
     pub fn op_matmul_a_bt(&self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> Op {
         let (m, k, n) = (a.shape[0], a.shape[1], b.shape[0]);
         self.op_mm(Kernel::MmAbt, Kernel::MmAbtF, a, b, c, m, n, k, "matmul_a_bt")
+    }
+
+    /// `C = X W + 1ₙb`, com ReLU opcional aplicada ainda em registradores.
+    ///
+    /// Substitui a sequência `matmul` + `bias_add` + `relu` por um dispatch só.
+    /// Exige o GEMM ladrilhado; com o ingênuo ligado, não há epílogo.
+    pub fn op_matmul_bias(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        vies: &GpuTensor,
+        relu: bool,
+    ) -> Op {
+        let (m, k, n) = (a.shape[0], a.shape[1], b.shape[1]);
+        self.montar(
+            Kernel::MmBias,
+            Dims {
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+                pad: u32::from(relu),
+            },
+            &[&a.buf, &b.buf, &c.buf, &vies.buf],
+            n.div_ceil(64) as u32,
+            m.div_ceil(64) as u32,
+            if relu { "mm_bias_relu" } else { "mm_bias" },
+        )
     }
 
     /// `Z ← Z + 1ₙ b`.
@@ -927,15 +959,17 @@ impl GpuMlp {
         let ultima = camadas.len() - 1;
 
         // ------------------------------------------------------------ avanço
+        //
+        // Um dispatch por camada: o GEMM aplica viés e ReLU no acumulador antes
+        // de escrever. As camadas ocultas guardam só a ativação em `a`; a de
+        // saída guarda os logits em `z`. Sem fusão eram três dispatches e cinco
+        // travessias de Z pela memória global por camada.
         let mut ops_fwd = Vec::new();
         for i in 0..=ultima {
             let entrada: &GpuTensor = if i == 0 { &xin } else { &camadas[i - 1].a };
             let c = &camadas[i];
-            ops_fwd.push(gpu.op_matmul(entrada, &c.w, &c.z));
-            ops_fwd.push(gpu.op_bias_add(&c.z, &c.b));
-            if i < ultima {
-                ops_fwd.push(gpu.op_relu(&c.z, &c.a));
-            }
+            let destino = if i < ultima { &c.a } else { &c.z };
+            ops_fwd.push(gpu.op_matmul_bias(entrada, &c.w, destino, &c.b, i < ultima));
         }
 
         // --------------------------------------------------- perda e backward
@@ -953,7 +987,9 @@ impl GpuMlp {
             if i > 0 {
                 let anterior = &camadas[i - 1];
                 ops_bwd.push(gpu.op_matmul_a_bt(&c.delta, &c.w, &anterior.delta));
-                ops_bwd.push(gpu.op_relu_bwd(&anterior.z, &anterior.delta));
+                // A máscara vem de `a`, não de `z`: como A = max(Z, 0), vale
+                // A > 0 ⟺ Z > 0, e a pré-ativação não precisa ser guardada.
+                ops_bwd.push(gpu.op_relu_bwd(&anterior.a, &anterior.delta));
             }
         }
 
