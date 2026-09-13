@@ -5,6 +5,23 @@ foram revertidas. O registro existe porque o que **não** funcionou economiza
 mais tempo de quem vem depois do que o que funcionou — e porque publicar só os
 acertos falsifica a taxa de sucesso real do trabalho.
 
+## Política do repositório
+
+**Nada do que foi tentado sai daqui.** Otimização revertida tem o código
+preservado em [`experimentos/`](experimentos/) com as medições no cabeçalho, e
+o resultado registrado neste arquivo com números. Erro de metodologia de medição
+também entra — neste projeto eles custaram mais tempo que os erros de código.
+
+Duas regras que decorrem disso:
+
+- **Não se reporta ganho que não foi medido.** Quando o efeito fica dentro do
+  ruído, o texto diz isso, e a otimização não recebe crédito.
+- **Quem discordar de uma rejeição pode medir.** É para isso que o código
+  rejeitado continua publicado, e não apenas descrito.
+
+Se você for contribuir e sua ideia não funcionar, mande mesmo assim: o resultado
+negativo tem lugar neste repositório.
+
 ## Otimizações
 
 | Tentativa | Resultado | Onde |
