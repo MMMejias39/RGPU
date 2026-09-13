@@ -280,7 +280,11 @@ fn f16_para_f32(h: u16) -> f32 {
             sinal << 31
         } else {
             // Subnormal: normaliza deslocando até o bit implícito aparecer.
-            let mut e: i32 = -1;
+            // O contador nasce em 0: cada deslocamento custa um expoente e o
+            // bit implícito precisa chegar ao lugar de `1,xxx` já contando a
+            // própria posição. Começar em −1 devolvia metade do valor em todo
+            // subnormal — ver `tests/f16.rs`.
+            let mut e: i32 = 0;
             let mut f = frac;
             while f & 0x400 == 0 {
                 f <<= 1;
@@ -1186,5 +1190,28 @@ impl Estado {
             }
         }
         portas.len()
+    }
+}
+
+#[cfg(test)]
+mod testes_f16 {
+    use super::f16_para_f32;
+
+    /// A conversão escrita à mão, conferida contra a `half` (2.5.0) num
+    /// projeto descartável fora do repositório; os valores estão fixados aqui
+    /// para não introduzir dependência.
+    ///
+    /// O caso que motivou o teste: o laço de normalização dos subnormais
+    /// contava um expoente a mais e devolvia metade do valor — `0x0001` dava
+    /// 2⁻²⁵ em vez de 2⁻²⁴. Amplitudes quânticas podem ser subnormais, e a
+    /// referência de CPU é o árbitro dos kernels.
+    #[test]
+    fn subnormais_e_normais() {
+        assert_eq!(f16_para_f32(0x0001), 1.0f32 * 2f32.powi(-24));
+        assert_eq!(f16_para_f32(0x0002), 2.0f32 * 2f32.powi(-24));
+        assert_eq!(f16_para_f32(0x03ff), 1023.0f32 * 2f32.powi(-24));
+        assert_eq!(f16_para_f32(0x0400), 6.103_515_6e-5); // menor normal, 2⁻¹⁴
+        assert_eq!(f16_para_f32(0x3c00), 1.0);
+        assert_eq!(f16_para_f32(0xc000), -2.0);
     }
 }
