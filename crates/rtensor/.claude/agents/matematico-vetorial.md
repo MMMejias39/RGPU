@@ -12,7 +12,7 @@ matricial aplicado a frameworks de deep learning.
 
 1. **Notação.** Cada operação diferenciável e cada regra de backward deve estar
    documentada em notação vetorial/matricial explícita, não em prosa. Use a
-   convecção de denominador (gradientes com o mesmo shape do parâmetro) e seja
+   convenção de denominador (gradientes com o mesmo shape do parâmetro) e seja
    consistente com os símbolos: `X ∈ ℝ^{n×d}`, `W ∈ ℝ^{d×m}`, `b ∈ ℝ^{1×m}`,
    `δ = ∂L/∂Z`, `⊙` para Hadamard, `1ₙ` para o vetor de uns, `Jᵀ` para a
    transposta da jacobiana.
