@@ -91,8 +91,13 @@ sobre o ladrilho `t`, escondendo a latência da memória atrás da aritmética.
 |---|---:|
 | ingênuo, 1 elemento por thread | 840 |
 | ladrilhado | 3.290 |
-| ladrilhado + buffer duplo | **4.002** |
+| ladrilhado + buffer duplo | **4.230** |
 | cuBLAS (via TensorFlow, com TF32) | 11.946 |
+
+O bloco `8×8` por thread, que o cuBLAS usa, foi implementado e medido **5% mais
+lento** — a sonda `examples/ocupacao.rs` explica por quê: aritmética pura
+sustenta 15–18 TFLOP/s nesta placa, e o GEMM anda a 4. Estando 4× longe do
+limite das ULAs, dobrar a intensidade aritmética só custa ocupação.
 
 Ainda 3× atrás do cuBLAS. Mas com o TF32 desligado o TensorFlow cai só 12%, o
 que localiza a maior parte da diferença em pipelining, tiling multinível e

@@ -15,6 +15,18 @@
 //!   bloco `4×4` da saída. No laço interno ela lê 4 valores de `A` e 4 de `B`
 //!   e faz 16 FMAs — intensidade de **2 FMAs por leitura**, 4× a do ingênuo.
 //!
+//! O bloco `8×8`, que o cuBLAS usa e que dobraria a intensidade para 4 FMAs por
+//! leitura, foi implementado e **medido como 5% mais lento**: 3.846 contra
+//! 4.030 GFLOP/s em 4096³. A razão está em `examples/ocupacao.rs`: a sonda
+//! mostra que aritmética pura sustenta 15 a 18 TFLOP/s nesta placa, enquanto o
+//! GEMM anda a 4. Estando 4× longe do limite das ULAs, o gargalo não é
+//! intensidade aritmética, e dobrá-la só custa ocupação.
+//!
+//! Os acumuladores são acessados **sempre por índice constante**. Isso não é
+//! estilo: a mesma sonda mediu que um array percorrido por índice de laço desaba
+//! para 25% da vazão, porque o compilador deixa de desenrolar e derrama os
+//! acumuladores para memória local.
+//!
 //! O acumulador é `array<vec4<f32>, 4>` com índices constantes, para que o
 //! compilador o mantenha em registradores em vez de derramar para memória local.
 //!
