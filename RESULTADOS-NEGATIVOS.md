@@ -33,6 +33,7 @@ negativo tem lugar neste repositório.
 | Redução de coluna em dois estágios | ganho não isolado | em produção |
 | Padding contra conflito de bancos | **nulo** | mantido |
 | Bloco 8×8 por thread | **−5%** | [revertido](experimentos/gemm-8x8/) |
+| Leituras globais `vec4` | **nulo** | [revertido](experimentos/gemm-vec4/) |
 
 ### Bloco 8×8 por thread — rejeitado
 
@@ -52,6 +53,24 @@ ULAs, o gargalo não é intensidade aritmética — dobrá-la só custa ocupaç�
 O kernel está preservado em [`experimentos/gemm-8x8/`](experimentos/gemm-8x8/)
 para que a tentativa não precise ser refeita, e para que quem discordar da
 conclusão possa medir por conta própria.
+
+### Leituras globais de 128 bits — rejeitado
+
+Bindings de `A` e `B` como `array<vec4<f32>>`: uma leitura de 128 bits por
+thread em vez de quatro de 32. Passou nos 42 casos de conferência e não rendeu.
+
+```
+2048³            escalar: 4.230 GFLOP/s    vec4: 4.172
+4096³            escalar: 4.030            vec4: 4.044
+4096×4096×64     escalar: 3.541            vec4: 3.306
+```
+
+O último formato é o teste decisivo: com `K = 64` e `M = N = 4096` há
+pouquíssimo cálculo por byte lido — exatamente onde uma leitura mais larga
+deveria aparecer. Não apareceu.
+
+Revertido por não pagar a complexidade: três pipelines a mais, um módulo WGSL a
+mais e lógica de alinhamento no despacho, em troca de zero.
 
 ### Padding contra conflito de bancos — mantido, sem ganho
 
@@ -119,10 +138,19 @@ Dá medição falha. Hoje é descartada.
 
 ## O padrão
 
-Em cinco das seis previsões confiantes feitas durante o desenvolvimento, o
+Em seis das sete previsões confiantes feitas durante o desenvolvimento, o
 gargalo foi **identificado corretamente** e o **peso dele foi superestimado**.
 Foi assim com o cache de descritores, com a redução de coluna, com o padding de
-bancos e com o bloco 8×8.
+bancos, com o bloco 8×8 e com as leituras `vec4`.
+
+**Três micro-otimizações do laço interno falharam em sequência** — swizzling,
+bloco 8×8 e leituras vetoriais. Isso deixou de ser azar e virou sinal: o laço
+interno não é o gargalo. A sonda de ocupação confirma por outro caminho, ao
+mostrar que aritmética pura sustenta 15–18 TFLOP/s nesta placa enquanto o GEMM
+anda a 4.
+
+O que a literatura clássica indica em seguida está em
+[ROTEIRO-GEMM.md](ROTEIRO-GEMM.md).
 
 É por isso que `examples/ocupacao.rs` e `examples/perfil.rs` existem: para que
 essa classe de decisão seja medida antes de ser implementada, e não depois.
