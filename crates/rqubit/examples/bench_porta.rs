@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use rgpu_power::Medidor;
-use rqubit::{Estado, Porta1, Precisao};
+use rqubit::{Estado, Porta1, Porta2, Precisao};
 use rtensor::gpu::Gpu;
 
 fn main() {
@@ -29,11 +29,11 @@ fn main() {
     medidor.calibrar_ociosidade(4.0);
 
     println!(
-        "{:>7} {:>7} {:>10} {:>11} {:>10} {:>11} {:>12}",
-        "qubits", "prec.", "memória", "ms/porta", "GB/s", "µJ/porta", "portas/s"
+        "{:>7} {:>7} {:>7} {:>11} {:>10} {:>11} {:>12}",
+        "qubits", "porta", "prec.", "ms/porta", "GB/s", "µJ/porta", "portas/s"
     );
 
-    for qubits in [20usize, 22, 24, 26, 27, 28, 29] {
+    for qubits in [22usize, 24, 26, 27, 28] {
       for precisao in [Precisao::F32, Precisao::F16] {
         // Acima do teto de cada precisão o construtor recusa, e o laço segue.
         let estado = match Estado::novo_com(&gpu, qubits, precisao) {
@@ -41,54 +41,67 @@ fn main() {
             Err(_) => continue,
         };
 
-        // Hadamard no qubit 0: o padrão de acesso mais próximo possível, com os
-        // dois elementos do par adjacentes na memória.
-        let porta = Porta1::hadamard();
-        let aplicar = |n: usize| {
-            let mut enc = gpu.encoder();
-            for i in 0..n {
-                estado.aplicar(&gpu, &mut enc, &porta, i % qubits);
-            }
-            gpu.submit(enc);
-            gpu.sync();
-        };
+        let h = Porta1::hadamard();
+        let cnot = Porta2::cnot();
 
-        aplicar(4);
-        let t0 = Instant::now();
-        aplicar(20);
-        let por_porta = t0.elapsed().as_secs_f64() / 20.0;
+        // Mesmo tráfego nas duas: cada amplitude é lida e reescrita uma vez.
+        // O que muda é a aritmética — 4 multiplicações complexas por par contra
+        // 16 por grupo.
+        for (rotulo, duas) in [("1q", false), ("2q", true)] {
+            let aplicar = |n: usize| {
+                let mut enc = gpu.encoder();
+                for i in 0..n {
+                    if duas {
+                        let q0 = i % qubits;
+                        let q1 = (q0 + 1 + i % (qubits - 1)) % qubits;
+                        let q1 = if q1 == q0 { (q0 + 1) % qubits } else { q1 };
+                        estado.aplicar2(&gpu, &mut enc, &cnot, q0, q1);
+                    } else {
+                        estado.aplicar(&gpu, &mut enc, &h, i % qubits);
+                    }
+                }
+                gpu.submit(enc);
+                gpu.sync();
+            };
 
-        // Janela longa o bastante para o sensor de potência acompanhar.
-        let n_energia = ((5.0 / por_porta) as usize).clamp(20, 20_000);
-        let (_, m) = medidor.medir(|| aplicar(n_energia));
+            aplicar(4);
+            let t0 = Instant::now();
+            aplicar(20);
+            let por_porta = t0.elapsed().as_secs_f64() / 20.0;
 
-        // Cada par lê 2 amplitudes e escreve 2, logo o tráfego é
-        // 2ⁿ × 2 × bytes_por_amplitude.
-        let bytes = (1u64 << qubits) * 2 * precisao.bytes_por_amplitude() as u64;
-        let uj = m
-            .energia_gpu_total_j()
-            .map(|j| j / n_energia as f64 * 1e6);
+            // Janela longa o bastante para o sensor de potência acompanhar.
+            let n_energia = ((5.0 / por_porta) as usize).clamp(20, 20_000);
+            let (_, m) = medidor.medir(|| aplicar(n_energia));
 
-        println!(
-            "{:>7} {:>7} {:>10} {:>11.4} {:>10.1} {:>11} {:>12.0}",
-            qubits,
-            if precisao == Precisao::F32 { "f32" } else { "f16" },
-            format!("{} MB", estado.bytes() / (1 << 20)),
-            por_porta * 1e3,
-            bytes as f64 / por_porta / 1e9,
-            uj.map_or("—".into(), |v| format!("{v:.1}")),
-            1.0 / por_porta,
-        );
+            let bytes = (1u64 << qubits) * 2 * precisao.bytes_por_amplitude() as u64;
+            let uj = m.energia_gpu_total_j().map(|j| j / n_energia as f64 * 1e6);
+
+            println!(
+                "{:>7} {:>7} {:>7} {:>11.4} {:>10.1} {:>11} {:>12.0}",
+                qubits,
+                rotulo,
+                if precisao == Precisao::F32 { "f32" } else { "f16" },
+                por_porta * 1e3,
+                bytes as f64 / por_porta / 1e9,
+                uj.map_or("—".into(), |v| format!("{v:.1}")),
+                1.0 / por_porta,
+            );
+        }
       }
     }
 
     println!(
-        "\nA RTX 4070 Laptop tem ~256 GB/s — a simulação encosta em 83% disso,\n\
-         o que confirma que é carga governada por banda. É o regime oposto ao\n\
-         do GEMM, e onde a precisão mista deve render o que não rendeu lá.\n\
+        "\nA RTX 4070 Laptop tem ~256 GB/s, e a simulação encosta em ~80% disso:\n\
+         carga governada por banda. Duas consequências medidas acima:\n\
          \n\
-         O teto de {} qubits não é de VRAM: o WebGPU limita um binding de\n\
-         armazenamento a 2 GB, e o vetor de estado é um buffer só.",
-        rqubit::Estado::MAX_QUBITS
+         - meia precisão dá ~2× em tempo e energia, metade dos bytes;\n\
+         - a porta de dois qubits faz 4× a aritmética da de um qubit no MESMO\n\
+           tempo, porque move os mesmos bytes — mas gasta 6 a 7% mais energia.\n\
+           Pelo cronômetro ela é de graça; pelo wattímetro, não.\n\
+         \n\
+         Teto de {} qubits em f32 e {} em f16 — limite de binding do WebGPU,\n\
+         não de VRAM.",
+        Precisao::F32.max_qubits(),
+        Precisao::F16.max_qubits()
     );
 }

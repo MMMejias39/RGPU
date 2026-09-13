@@ -225,6 +225,28 @@ Portas de **um e dois qubits** — Hadamard, Pauli-X/Z, rotação Y, fase, CNOT,
 e SWAP — o suficiente para circuitos universais. Conferidas contra referência de
 CPU, incluindo o estado de Bell, que só passa se o emaranhamento estiver certo.
 
+### Aritmética de graça no tempo, não na energia
+
+A porta de dois qubits move **os mesmos bytes** que a de um qubit — cada
+amplitude é lida e reescrita uma vez — mas faz **4× a aritmética**: 16
+multiplicações complexas por grupo contra 4 por par.
+
+| Qubits | Porta | Precisão | ms | µJ |
+|---:|---:|---:|---:|---:|
+| 27 | 1q | f32 | 10,266 | 519.581 |
+| 27 | 2q | f32 | **10,186** | **557.237** |
+| 27 | 1q | f16 | 5,202 | 276.686 |
+| 27 | 2q | f16 | **5,178** | **293.336** |
+| 28 | 1q | f16 | 10,423 | 550.032 |
+| 28 | 2q | f16 | **10,357** | **585.391** |
+
+**Mesmo tempo, 6 a 7% mais energia.** Numa carga limitada por banda, a
+aritmética extra não custa relógio — mas custa watt. Pelo cronômetro a porta de
+dois qubits é gratuita; pelo wattímetro, não é.
+
+É a terceira vez neste repositório que a medição de energia diz algo que a de
+tempo não diria.
+
 Nenhum simulador existente — Qiskit Aer, cuQuantum, qsim — publica joules por
 porta. Aqui isso sai de graça, porque o instrumento já existe.
 
