@@ -47,6 +47,7 @@
 
 mod gemm;
 mod kernels;
+mod splitk;
 mod strassen;
 
 use std::cell::{Cell, RefCell};
@@ -110,6 +111,21 @@ struct EspalhaP {
     s4: f32,
 }
 
+/// Uniforme do GEMM particionado na dimensão interna.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SplitP {
+    m: u32,
+    n: u32,
+    k: u32,
+    grid_x: u32,
+    fatias: u32,
+    /// Quantos ladrilhos de `K` cabem numa fatia.
+    tiles_fatia: u32,
+    p0: u32,
+    p1: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct P4 {
@@ -151,6 +167,9 @@ enum Kernel {
     Adam,
     Combina,
     Espalha,
+    SplitK,
+    SplitKAtb,
+    Reduz,
 }
 
 /// Uma operação com tudo já resolvido: só falta gravá-la num encoder.
@@ -211,6 +230,9 @@ pub struct Gpu {
     mm_bias: wgpu::ComputePipeline,
     combina: wgpu::ComputePipeline,
     espalha: wgpu::ComputePipeline,
+    split_k: wgpu::ComputePipeline,
+    split_k_atb: wgpu::ComputePipeline,
+    reduz: wgpu::ComputePipeline,
     bias_add: wgpu::ComputePipeline,
     relu: wgpu::ComputePipeline,
     relu_bwd: wgpu::ComputePipeline,
@@ -355,6 +377,9 @@ impl Gpu {
             mm_bias: pipe(gemm::MM_EPILOGO, "mm_bias", "mm_bias"),
             combina: pipe(strassen::COMBINA, "combina", "combina"),
             espalha: pipe(strassen::ESPALHA, "espalha", "espalha"),
+            split_k: pipe(splitk::MM_SPLITK, "mm", "split_k"),
+            split_k_atb: pipe(splitk::MM_SPLITK, "mm_atb", "split_k_atb"),
+            reduz: pipe(splitk::REDUZ, "reduz", "reduz"),
             bias_add: pipe(kernels::VEC, "bias_add", "bias_add"),
             relu: pipe(kernels::VEC, "relu", "relu"),
             relu_bwd: pipe(kernels::RELU_BWD, "relu_bwd", "relu_bwd"),
@@ -421,6 +446,9 @@ impl Gpu {
             Kernel::Adam => &self.adam,
             Kernel::Combina => &self.combina,
             Kernel::Espalha => &self.espalha,
+            Kernel::SplitK => &self.split_k,
+            Kernel::SplitKAtb => &self.split_k_atb,
+            Kernel::Reduz => &self.reduz,
         }
     }
 
@@ -999,6 +1027,90 @@ impl Gpu {
             gy,
             rotulo,
         )
+    }
+
+    /// Quantas fatias de `K` valem a pena, dada a forma.
+    ///
+    /// Só faz sentido particionar quando a saída não gera blocos suficientes
+    /// para ocupar a placa. O alvo de **64 workgroups no total** vem da medição,
+    /// não de estimativa: varrendo 4, 16, 64 e 128 fatias, o ótimo ficou sempre
+    /// onde `blocos × fatias ≈ 64`.
+    ///
+    /// | Forma | blocos | melhor | ganho |
+    /// |---|---|---|---|
+    /// | 64×64×8192 | 1 | 64 fatias | 14,8× |
+    /// | 64×64×16384 | 1 | 64 fatias | 21,4× |
+    /// | 128×128×4096 | 4 | 16 fatias | 5,6× |
+    ///
+    /// Acima disso a redução e o tráfego das parciais passam a custar mais do
+    /// que o paralelismo extra rende.
+    pub fn fatias_sugeridas(m: usize, n: usize, k: usize) -> usize {
+        const ALVO_WORKGROUPS: usize = 64;
+        let blocos = m.div_ceil(64) * n.div_ceil(64);
+        let tiles_k = k.div_ceil(16);
+        if blocos >= ALVO_WORKGROUPS || tiles_k < 8 {
+            return 1;
+        }
+        // Não vale fatiar mais fino que 4 ladrilhos de `K` por fatia.
+        (ALVO_WORKGROUPS / blocos).min(tiles_k / 4).max(1)
+    }
+
+    /// `C = A · B` (ou `Aᵀ · B`) com `K` particionado em `fatias`.
+    ///
+    /// Devolve as operações em ordem: o produto parcial e a redução. O buffer
+    /// `parciais` precisa de `fatias × m × n` elementos.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ops_split_k(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        parciais: &GpuTensor,
+        fatias: usize,
+        transposta: bool,
+    ) -> Vec<Op> {
+        let (m, k) = if transposta {
+            (a.shape[1], a.shape[0])
+        } else {
+            (a.shape[0], a.shape[1])
+        };
+        let n = b.shape[1];
+
+        let tiles_k = k.div_ceil(16);
+        let tiles_fatia = tiles_k.div_ceil(fatias);
+        let blocos = m.div_ceil(64) * n.div_ceil(64);
+        let (gx, gy) = Self::grade(blocos * fatias);
+
+        let produto = self.montar(
+            if transposta { Kernel::SplitKAtb } else { Kernel::SplitK },
+            SplitP {
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+                grid_x: gx,
+                fatias: fatias as u32,
+                tiles_fatia: tiles_fatia as u32,
+                p0: 0,
+                p1: 0,
+            },
+            &[&a.buf, &b.buf, &parciais.buf],
+            gx,
+            gy,
+            "split_k",
+        );
+
+        let elementos = m * n;
+        let (rx, ry) = Self::grade(elementos.div_ceil(256));
+        let reducao = self.montar(
+            Kernel::Reduz,
+            P4 { a: elementos as u32, b: fatias as u32, c: rx, d: 0 },
+            &[&parciais.buf, &c.buf],
+            rx,
+            ry,
+            "split_k_reduz",
+        );
+
+        vec![produto, reducao]
     }
 
     pub fn encoder(&self) -> wgpu::CommandEncoder {

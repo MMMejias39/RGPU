@@ -101,8 +101,15 @@ quase ninguém mede.
    clássico, bem abaixo das duas ordens de grandeza que a literatura reporta
    para vários níveis em `n = 16384`. Não é automático, justamente por perder na
    faixa comum.
-3. **Split-K** — não melhora o caso comum, mas corrige o patológico: o GEMM com
-   `K` dominante roda a 55 GFLOP/s, 1,3% da capacidade da placa.
+3. ~~**Split-K**~~ — **feito**, e foi o maior ganho de toda a sequência:
+   **12,6× a 21,4×** nas formas K-dominantes. Não melhora o caso comum, como
+   previsto; corrige o patológico.
 
 O que **não** fazer: mais micro-otimização do laço interno. Três tentativas, três
 resultados nulos ou negativos, e uma sonda que explica por quê.
+
+## O saldo
+
+Os três itens que a literatura indicou renderam; as três micro-otimizações do
+laço interno não. O padrão é consistente: **o que paga é mexer em como os dados
+se movem e em quanta conta se faz, não em como o laço interno a executa.**

@@ -108,6 +108,36 @@ lento** — a sonda `examples/ocupacao.rs` explica por quê: aritmética pura
 sustenta 15–18 TFLOP/s nesta placa, e o GEMM anda a 4. Estando 4× longe do
 limite das ULAs, dobrar a intensidade aritmética só custa ocupação.
 
+### Split-K: o caso patológico
+
+Com `M` e `N` pequenos, a saída inteira cabe em poucos blocos: um GEMM
+`64×64×8192` ocupa **um** workgroup, 256 threads, numa placa de 36 SMs. O
+trabalho existe — são 512 ladrilhos de acumulação — mas não há paralelismo para
+distribuí-lo.
+
+Não é caso raro: `∂L/∂W = Xᵀδ` tem `K` igual ao tamanho do lote, e `M`, `N`
+iguais às dimensões da camada. Lote grande com camada estreita cai exatamente
+aqui.
+
+Particionando `K` em fatias que somam num plano próprio, seguidas de uma
+redução:
+
+| Forma | Inteiro | Split-K | Ganho |
+|---|---:|---:|---:|
+| 64×64×8192 | 63 GFLOP/s | **935** | **14,8×** |
+| 64×64×16384 | 64 | **1.364** | **21,4×** |
+| 32×32×8192 | 21 | **294** | **14,3×** |
+| 128×128×4096 | 334 | **1.867** | **5,6×** |
+
+O número de fatias vem da medição: varrendo 4, 16, 64 e 128 em quatro execuções,
+**64 venceu nas quatro** (12,6× a 14,5×), com 128 oscilando entre 6,1× e 13,1×.
+`Gpu::fatias_sugeridas` mira `blocos × fatias ≈ 64`, que reproduz o ótimo medido
+nas quatro formas testadas.
+
+Cada fatia escreve num plano separado — não há escrita concorrente no mesmo
+endereço, e portanto nenhuma necessidade de atômicos, que em WGSL não existem
+para `f32`.
+
 ### Strassen de um nível
 
 Sete produtos de metade das dimensões no lugar de oito: **12,5% menos

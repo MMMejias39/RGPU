@@ -303,3 +303,65 @@ fn strassen_recusa_dimensoes_impares() {
     };
     assert!(erro.contains("pares"), "mensagem inesperada: {erro}");
 }
+
+/// O GEMM particionado precisa dar o mesmo resultado do inteiro, em formas
+/// K-dominantes e com números de fatias diferentes.
+#[test]
+fn split_k_confere_com_a_cpu() {
+    let Some(gpu) = abrir() else { return };
+
+    // (M, N, K) — formas onde a saída é pequena e a dimensão interna é grande.
+    for (m, n, k) in [(64usize, 64usize, 4096usize), (32, 96, 2048), (128, 64, 1024)] {
+        let a = Tensor::new(&[m, k], (0..m * k).map(|i| (i as f32 * 0.013).sin()).collect());
+        let b = Tensor::new(&[k, n], (0..k * n).map(|i| (i as f32 * 0.007).cos()).collect());
+        let esperado = a.matmul(&b);
+        let at = a.t(); // [k, m], para a variante transposta
+
+        let ga = gpu.upload(&a);
+        let gat = gpu.upload(&at);
+        let gb = gpu.upload(&b);
+
+        // Referência: o mesmo GEMM sem particionar, na mesma GPU. É contra ela
+        // que o particionado é julgado — a diferença para a CPU inclui o erro
+        // de ordem de soma, que existe nos dois.
+        let c_inteiro = gpu.zeros(&[m, n]);
+        let mut enc = gpu.encoder();
+        gpu.matmul(&mut enc, &ga, &gb, &c_inteiro);
+        gpu.submit(enc);
+        let e_inteiro = erro_rel(&esperado, &gpu.download(&c_inteiro));
+
+        for fatias in [1usize, 2, 4, 8, 16] {
+            for (transposta, entrada) in [(false, &ga), (true, &gat)] {
+                let c = gpu.zeros(&[m, n]);
+                let parciais = gpu.zeros(&[fatias * m, n]);
+                let mut enc = gpu.encoder();
+                for op in gpu.ops_split_k(entrada, &gb, &c, &parciais, fatias, transposta) {
+                    gpu.record(&mut enc, &op);
+                }
+                gpu.submit(enc);
+
+                let e = erro_rel(&esperado, &gpu.download(&c));
+                // Particionar muda a ordem das somas, então o erro muda — mas
+                // não deve degradar. O fator 3 cobre a variação de ordenação
+                // sem deixar passar um erro de indexação, que daria ordens de
+                // grandeza.
+                assert!(
+                    e < (e_inteiro * 3.0).max(2e-5),
+                    "{m}×{n}×{k}, {fatias} fatias, transposta={transposta}: \
+                     erro {e:.2e} contra {e_inteiro:.2e} do GEMM inteiro"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fatias_sugeridas_respeita_a_forma() {
+    use rtensor::gpu::Gpu;
+    // Saída pequena e K grande: vale particionar.
+    assert!(Gpu::fatias_sugeridas(64, 64, 8192) > 1);
+    // Saída grande: já há paralelismo, não particiona.
+    assert_eq!(Gpu::fatias_sugeridas(4096, 4096, 4096), 1);
+    // K curto: não há o que fatiar.
+    assert_eq!(Gpu::fatias_sugeridas(64, 64, 64), 1);
+}

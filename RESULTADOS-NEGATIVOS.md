@@ -36,6 +36,7 @@ negativo tem lugar neste repositório.
 | Leituras globais `vec4` | **nulo** | [revertido](experimentos/gemm-vec4/) |
 | Rasterização com consciência de L2 | **+5 a 6%** em 4096³ | em produção |
 | Strassen de um nível | **+11 a 13%** acima de 4096³, **−52%** em 1024³ | opcional |
+| Split-K | **+12,6× a 21,4×** em formas K-dominantes | opcional |
 
 ### Bloco 8×8 por thread — rejeitado
 

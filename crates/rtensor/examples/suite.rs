@@ -281,6 +281,70 @@ fn elem(gpu: &Gpu) {
     }
 }
 
+// ------------------------------------------------------------------ splitk
+
+/// O caso patológico: saída pequena, dimensão interna grande.
+#[cfg(feature = "gpu")]
+fn splitk(gpu: &Gpu) {
+    let casos: [(usize, usize, usize); 4] = [
+        (64, 64, 8192),
+        (64, 64, 16384),
+        (32, 32, 8192),
+        (128, 128, 4096),
+    ];
+
+    println!(
+        "{:>18} {:>8} {:>11} {:>11} {:>10}",
+        "caso", "fatias", "ms", "GFLOP/s", "vs inteiro"
+    );
+    for (m, n, k) in casos {
+        let a = Tensor::new(&[m, k], (0..m * k).map(|i| (i as f32 * 0.001).sin()).collect());
+        let b = Tensor::new(&[k, n], (0..k * n).map(|i| (i as f32 * 0.002).cos()).collect());
+        let ga = gpu.upload(&a);
+        let gb = gpu.upload(&b);
+        let c = gpu.zeros(&[m, n]);
+        let gflop = 2.0 * m as f64 * n as f64 * k as f64 / 1e9;
+        let reps = 50;
+
+        let cronometrar = |grava: &dyn Fn(&mut wgpu::CommandEncoder)| -> f64 {
+            let mut enc = gpu.encoder();
+            grava(&mut enc);
+            gpu.submit(enc);
+            gpu.sync();
+            let inicio = Instant::now();
+            let mut enc = gpu.encoder();
+            for _ in 0..reps {
+                grava(&mut enc);
+            }
+            gpu.submit(enc);
+            gpu.sync();
+            inicio.elapsed().as_secs_f64() / reps as f64
+        };
+
+        let t_inteiro = cronometrar(&|enc| gpu.matmul(enc, &ga, &gb, &c));
+        println!(
+            "{:>18} {:>8} {:>11.4} {:>11.1} {:>10}",
+            format!("{m}×{n}×{k}"), 1, t_inteiro * 1e3, gflop / t_inteiro, "(base)"
+        );
+
+        for fatias in [4usize, 16, 64, 128] {
+            let parciais = gpu.zeros(&[fatias * m, n]);
+            let ops = gpu.ops_split_k(&ga, &gb, &c, &parciais, fatias, false);
+            let t = cronometrar(&|enc| {
+                for op in &ops {
+                    gpu.record(enc, op);
+                }
+            });
+            println!(
+                "{:>18} {:>8} {:>11.4} {:>11.1} {:>9.1}×",
+                "", fatias, t * 1e3, gflop / t, t_inteiro / t
+            );
+        }
+        println!();
+    }
+    println!("sugestão automática para 64×64×8192: {} fatias", Gpu::fatias_sugeridas(64, 64, 8192));
+}
+
 fn main() {
     let teste = std::env::args().nth(1).unwrap_or_else(|| "gemm".into());
 
@@ -294,6 +358,7 @@ fn main() {
             "arch" => arch(&gpu),
             "infer" => infer(&gpu),
             "elem" => elem(&gpu),
+            "splitk" => splitk(&gpu),
             outro => eprintln!("teste desconhecido: {outro}"),
         }
     }
