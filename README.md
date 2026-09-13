@@ -10,7 +10,24 @@ Metal, DX12 ou WebGPU, então o mesmo código roda em NVIDIA, AMD, Intel e Apple
 |---|---|
 | [`rtensor`](crates/rtensor) | Framework de deep learning: tensor com broadcasting, autodiff reverso, camadas, otimizadores e backend de GPU |
 | [`rgpu-power`](crates/rgpu-power) | Medição de energia: potência da GPU por `nvidia-smi`, energia da CPU e da GPU integrada por RAPL |
-| [`rqubit`](crates/rqubit) | Simulador de vetor de estado quântico: portas de 1 e 2 qubits, com medição de energia |
+| [`rqubit`](crates/rqubit) | Simulador de vetor de estado quântico: kernels especializados de 1 a 6 qubits, fusão de portas e medição de energia |
+
+## O que este repositório mostra
+
+Três resultados, cada um medido e reproduzível:
+
+1. **O lock-in do CUDA é contornável.** O mesmo WGSL roda em NVIDIA e Intel, e
+   na simulação quântica **empata com o `cuStateVec`** — a biblioteca da própria
+   NVIDIA — por porta aplicada.
+2. **O desperdício está no software, não no silício.** Mudando só o tamanho do
+   lote, a energia por amostra treinada varia **78×** no mesmo chip.
+3. **Tempo e energia são métricas diferentes.** Em quatro ocasiões a medição de
+   energia contradisse a de tempo, e nenhum dos frameworks comparados —
+   TensorFlow, PyTorch, burn, candle, Qiskit Aer, cuQuantum — publica a segunda.
+
+E uma lição de método que atravessa tudo: **a otimização certa depende do
+regime**, e o regime precisa ser medido antes. A mesma precisão mista é perda de
+10% de energia no GEMM e ganho de 2× na simulação quântica.
 
 ## Desempenho
 
@@ -94,6 +111,7 @@ sobre o ladrilho `t`, escondendo a latência da memória atrás da aritmética.
 | ladrilhado | 3.290 |
 | ladrilhado + buffer duplo | 4.230 |
 | + rasterização com consciência de L2 | **4.386** |
+| cuBLAS, com TF32 | 11.946 |
 | cuBLAS (via TensorFlow, com TF32) | 11.946 |
 
 A rasterização segue a blocagem de L2 do Goto na forma que uma GPU permite: não
@@ -502,10 +520,33 @@ desde a mitigação do PLATYPUS (2020).
 ## Rodando
 
 ```bash
-cargo test --workspace --features rtensor/gpu       # 25 testes
+cargo test --workspace --features rtensor/gpu   # 50 testes em 9 suítes
+cargo test -p rtensor                           # núcleo, sem GPU
+```
+
+Deep learning e o GEMM:
+
+```bash
+cargo run -p rtensor --release --features gpu --example suite -- batch  # varredura de lote
+cargo run -p rtensor --release --features gpu --example bench_gemm      # GEMM, com varreduras
+cargo run -p rtensor --release --features gpu --example perfil          # perfilamento por kernel
+cargo run -p rtensor --release --features gpu --example ocupacao         # pressão de registradores
+```
+
+Energia:
+
+```bash
 cargo run -p rtensor --release --features gpu --example eficiencia   # energia por ocupação
-cargo run -p rtensor --release --features gpu --example energia      # energia por motor e fabricante
-cargo run -p rtensor --release --features gpu --example perfil       # perfilamento por kernel
+cargo run -p rtensor --release --features gpu --example energia      # por motor e por fabricante
+sudo ./target/release/examples/frequencia                            # eficiência contra clock
+```
+
+Simulação quântica:
+
+```bash
+cargo run -p rqubit --release --example bench_porta   # banda e energia por porta
+cargo run -p rqubit --release --example bench_fusao   # fusão, varrendo o limite de qubits
+cargo run -p rqubit --release --example medir_externo -- <comando>   # energia de outro processo
 ```
 
 ## O que não funcionou
@@ -514,6 +555,14 @@ Toda otimização tentada, incluindo as revertidas, e os erros de medição que
 custaram mais tempo que os erros de código, estão em
 [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md). Publicar só os acertos
 falsificaria a taxa de sucesso real do trabalho.
+
+São **onze** otimizações que não pagaram, cada uma com números e causa
+identificada, ao lado das que pagaram. O código revertido fica preservado em
+[`experimentos/`](experimentos/), para que ninguém refaça a tentativa e para
+que quem discordar de uma rejeição possa medir.
+
+O roteiro do GEMM, com o que a literatura clássica indicou e o que sobrou por
+fazer, está em [ROTEIRO-GEMM.md](ROTEIRO-GEMM.md).
 
 ## Licença
 
