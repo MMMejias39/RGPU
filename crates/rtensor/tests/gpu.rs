@@ -365,3 +365,65 @@ fn fatias_sugeridas_respeita_a_forma() {
     // K curto: não há o que fatiar.
     assert_eq!(Gpu::fatias_sugeridas(64, 64, 64), 1);
 }
+
+/// Precisão mista tem de acertar a conta, e o quanto ela perde em precisão é
+/// medido — `f16` guarda ~3 dígitos decimais contra ~7 do `f32`.
+#[test]
+fn precisao_mista_confere_e_o_erro_e_medido() {
+    let Some(gpu) = abrir() else { return };
+
+    for (m, n, k) in [(64usize, 64usize, 64usize), (256, 128, 512), (512, 512, 256)] {
+        let a = Tensor::new(&[m, k], (0..m * k).map(|i| (i as f32 * 0.019).sin()).collect());
+        let b = Tensor::new(&[k, n], (0..k * n).map(|i| (i as f32 * 0.013).cos()).collect());
+        let esperado = a.matmul(&b);
+        let bt = b.t();
+
+        let (a16, _a32, op_a) = gpu.upload_f16(&a);
+        let (b16, _b32, op_b) = gpu.upload_f16(&b);
+        let (bt16, _bt32, op_bt) = gpu.upload_f16(&bt);
+        let at = a.t();
+        let (at16, _at32, op_at) = gpu.upload_f16(&at);
+
+        let c32 = gpu.zeros(&[m, n]);
+        let ga = gpu.upload(&a);
+        let gb = gpu.upload(&b);
+        let mut enc = gpu.encoder();
+        gpu.matmul(&mut enc, &ga, &gb, &c32);
+        gpu.submit(enc);
+        let e32 = erro_rel(&esperado, &gpu.download(&c32));
+
+        // As três combinações que a retropropagação usa.
+        for (nome, a_op, b_op, tr, btr) in [
+            ("A·B", &a16, &b16, false, false),
+            ("Aᵀ·B", &at16, &b16, true, false),
+            ("A·Bᵀ", &a16, &bt16, false, true),
+        ] {
+            let c = gpu.zeros(&[m, n]);
+            let mut enc = gpu.encoder();
+            for op in [&op_a, &op_b, &op_bt, &op_at] {
+                gpu.record(&mut enc, op);
+            }
+            let mm = gpu.op_matmul_f16(a_op, b_op, &c, tr, btr);
+            gpu.record(&mut enc, &mm);
+            gpu.submit(enc);
+
+            let e16 = erro_rel(&esperado, &gpu.download(&c));
+
+            // `f16` tem 11 bits de mantissa, então cada elemento já entra com
+            // erro relativo ~2⁻¹¹. Somando `K` termos, o erro esperado cresce
+            // com `√K`. O limite abaixo é dez vezes esse valor: largo o
+            // bastante para o ruído da meia precisão, apertado o bastante para
+            // pegar erro de indexação, que daria ordens de grandeza.
+            let esperado_f16 = 10.0 * (k as f32).sqrt() * 2.0f32.powi(-11);
+            eprintln!(
+                "{m}×{n}×{k} {nome}: f32 {e32:.2e}, mista {e16:.2e} \
+                 ({:.0}× o erro, limite teórico {esperado_f16:.2e})",
+                e16 / e32.max(1e-12)
+            );
+            assert!(
+                e16 < esperado_f16,
+                "{m}×{n}×{k} {nome}: erro {e16:.2e} acima do esperado para f16"
+            );
+        }
+    }
+}

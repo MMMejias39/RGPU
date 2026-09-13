@@ -69,3 +69,11 @@ required-features = ["gpu"]
 [[example]]
 name = "bench_strassen"
 required-features = ["gpu"]
+
+[[example]]
+name = "probe_f16"
+required-features = ["gpu"]
+
+[[example]]
+name = "bench_mista"
+required-features = ["gpu"]

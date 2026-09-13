@@ -47,6 +47,7 @@
 
 mod gemm;
 mod kernels;
+mod mista;
 mod splitk;
 mod strassen;
 
@@ -170,6 +171,10 @@ enum Kernel {
     SplitK,
     SplitKAtb,
     Reduz,
+    Empacota,
+    MmF16,
+    MmAtbF16,
+    MmAbtF16,
 }
 
 /// Uma operação com tudo já resolvido: só falta gravá-la num encoder.
@@ -233,6 +238,10 @@ pub struct Gpu {
     split_k: wgpu::ComputePipeline,
     split_k_atb: wgpu::ComputePipeline,
     reduz: wgpu::ComputePipeline,
+    empacota: wgpu::ComputePipeline,
+    mm_f16: wgpu::ComputePipeline,
+    mm_atb_f16: wgpu::ComputePipeline,
+    mm_abt_f16: wgpu::ComputePipeline,
     bias_add: wgpu::ComputePipeline,
     relu: wgpu::ComputePipeline,
     relu_bwd: wgpu::ComputePipeline,
@@ -380,6 +389,10 @@ impl Gpu {
             split_k: pipe(splitk::MM_SPLITK, "mm", "split_k"),
             split_k_atb: pipe(splitk::MM_SPLITK, "mm_atb", "split_k_atb"),
             reduz: pipe(splitk::REDUZ, "reduz", "reduz"),
+            empacota: pipe(mista::EMPACOTA, "empacota", "empacota"),
+            mm_f16: pipe(mista::MM_F16, "mm", "mm_f16"),
+            mm_atb_f16: pipe(mista::MM_F16, "mm_atb", "mm_atb_f16"),
+            mm_abt_f16: pipe(mista::MM_F16, "mm_abt", "mm_abt_f16"),
             bias_add: pipe(kernels::VEC, "bias_add", "bias_add"),
             relu: pipe(kernels::VEC, "relu", "relu"),
             relu_bwd: pipe(kernels::RELU_BWD, "relu_bwd", "relu_bwd"),
@@ -449,6 +462,10 @@ impl Gpu {
             Kernel::SplitK => &self.split_k,
             Kernel::SplitKAtb => &self.split_k_atb,
             Kernel::Reduz => &self.reduz,
+            Kernel::Empacota => &self.empacota,
+            Kernel::MmF16 => &self.mm_f16,
+            Kernel::MmAtbF16 => &self.mm_atb_f16,
+            Kernel::MmAbtF16 => &self.mm_abt_f16,
         }
     }
 
@@ -1111,6 +1128,89 @@ impl Gpu {
         );
 
         vec![produto, reducao]
+    }
+
+    /// Tensor com os elementos em meia precisão, dois por palavra.
+    ///
+    /// Reserva `⌈len/2⌉` palavras — metade do espaço do equivalente em `f32`.
+    pub fn zeros_f16(&self, shape: &[usize]) -> GpuTensor {
+        let len: usize = shape.iter().product();
+        let palavras = len.div_ceil(2);
+        let t = GpuTensor {
+            shape: shape.to_vec(),
+            len,
+            buf: self.storage(palavras, "f16"),
+        };
+        self.queue
+            .write_buffer(&t.buf, 0, bytemuck::cast_slice(&vec![0u32; palavras.max(1)]));
+        t
+    }
+
+    /// Converte um tensor `f32` residente para meia precisão empacotada.
+    pub fn op_empacota_f16(&self, src: &GpuTensor, dst: &GpuTensor) -> Op {
+        let palavras = src.len.div_ceil(2);
+        let (gx, gy) = Self::grade(palavras.div_ceil(256));
+        self.montar(
+            Kernel::Empacota,
+            P4 { a: src.len as u32, b: gx, c: 0, d: 0 },
+            &[&src.buf, &dst.buf],
+            gx,
+            gy,
+            "empacota_f16",
+        )
+    }
+
+    /// Envia um tensor já convertendo para meia precisão. Devolve o tensor e a
+    /// operação de conversão, que precisa ser gravada antes do uso.
+    pub fn upload_f16(&self, t: &Tensor) -> (GpuTensor, GpuTensor, Op) {
+        let origem = self.upload(t);
+        let destino = self.zeros_f16(t.shape());
+        let op = self.op_empacota_f16(&origem, &destino);
+        (destino, origem, op)
+    }
+
+    /// GEMM com operandos em meia precisão e acumulação em `f32`.
+    ///
+    /// `transposta` escolhe entre `A·B` e `Aᵀ·B`; `b_transposta`, entre `·B` e
+    /// `·Bᵀ`. As três combinações usadas pela retropropagação estão cobertas.
+    pub fn op_matmul_f16(
+        &self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+        transposta: bool,
+        b_transposta: bool,
+    ) -> Op {
+        let (kernel, m, n, k, rotulo) = match (transposta, b_transposta) {
+            (false, false) => (
+                Kernel::MmF16, a.shape[0], b.shape[1], a.shape[1], "matmul_f16",
+            ),
+            (true, false) => (
+                Kernel::MmAtbF16, a.shape[1], b.shape[1], a.shape[0], "matmul_at_b_f16",
+            ),
+            (false, true) => (
+                Kernel::MmAbtF16, a.shape[0], b.shape[0], a.shape[1], "matmul_a_bt_f16",
+            ),
+            (true, true) => panic!("Aᵀ·Bᵀ não é usado pela retropropagação"),
+        };
+        let (gx, gy, grupo) = self.grade_blocos(m, n, 64);
+        self.montar(
+            kernel,
+            Dims {
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+                grid_x: gx,
+                grupo,
+                p0: 0,
+                p1: 0,
+                p2: 0,
+            },
+            &[&a.buf, &b.buf, &c.buf],
+            gx,
+            gy,
+            rotulo,
+        )
     }
 
     pub fn encoder(&self) -> wgpu::CommandEncoder {

@@ -37,6 +37,7 @@ negativo tem lugar neste repositório.
 | Rasterização com consciência de L2 | **+5 a 6%** em 4096³ | em produção |
 | Strassen de um nível | **+11 a 13%** acima de 4096³, **−52%** em 1024³ | opcional |
 | Split-K | **+12,6× a 21,4×** em formas K-dominantes | opcional |
+| Precisão mista `f16`/`f32` | **+1 a 7%** de velocidade, **−5 a 11%** de energia | mantida por outra razão |
 
 ### Bloco 8×8 por thread — rejeitado
 
@@ -56,6 +57,32 @@ ULAs, o gargalo não é intensidade aritmética — dobrá-la só custa ocupaç�
 O kernel está preservado em [`experimentos/gemm-8x8/`](experimentos/gemm-8x8/)
 para que a tentativa não precise ser refeita, e para que quem discordar da
 conclusão possa medir por conta própria.
+
+### Precisão mista — não é ganho de velocidade nem de energia
+
+Operandos em `f16` empacotado, acumulação em `f32`. A hipótese era que o GEMM
+estava limitado por banda de memória, e que cortar os bytes pela metade quase
+dobraria a vazão.
+
+**A conta que sustentava a hipótese estava errada.** O `1 GB` que eu atribuí ao
+tráfego de 2048³ supõe reuso zero de L2 — é um limite superior, não o tráfego
+real. Com a rasterização de L2 em operação, a ida efetiva à DRAM é bem menor, e
+a placa não está perto de saturada.
+
+| Tamanho | Velocidade | Eficiência energética | Erro |
+|---|---:|---:|---:|
+| 2048³ | +6,6% | −10,9% | 6.827× |
+| 4096³ | +1,2% | −5,4% | 5.983× |
+| 6144³ | +2,3% | −10,0% | 3.864× |
+
+O desempacotamento custa ULA por elemento lido; numa carga que não é limitada
+por banda, essa conta extra gasta potência sem comprar tempo. Foi a primeira vez
+que a medição de energia contradisse a de tempo — e é exatamente para isso que
+ela existe.
+
+**Mantida, mas por outra razão:** os operandos ocupam metade do espaço, o que
+permite modelos ou lotes maiores quando a VRAM é o limite. É troca de precisão
+por capacidade, não por velocidade, e o código diz isso.
 
 ### Leituras globais de 128 bits — rejeitado
 
@@ -151,6 +178,12 @@ bloco 8×8 e leituras vetoriais. Isso deixou de ser azar e virou sinal: o laço
 interno não é o gargalo. A sonda de ocupação confirma por outro caminho, ao
 mostrar que aritmética pura sustenta 15–18 TFLOP/s nesta placa enquanto o GEMM
 anda a 4.
+
+**E o gargalo continua não identificado.** A hipótese seguinte — banda de
+memória — foi testada com precisão mista e também caiu: cortar os bytes pela
+metade rendeu 1 a 7%. Não é ULA, não é banda de DRAM, não é o laço interno.
+Sobram largura de banda da memória compartilhada e taxa de emissão de
+instruções, e nenhuma das duas foi medida ainda. Essa é a pergunta em aberto.
 
 O que a literatura clássica indica em seguida está em
 [ROTEIRO-GEMM.md](ROTEIRO-GEMM.md).
