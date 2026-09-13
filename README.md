@@ -91,8 +91,17 @@ sobre o ladrilho `t`, escondendo a latência da memória atrás da aritmética.
 |---|---:|
 | ingênuo, 1 elemento por thread | 840 |
 | ladrilhado | 3.290 |
-| ladrilhado + buffer duplo | **4.230** |
+| ladrilhado + buffer duplo | 4.230 |
+| + rasterização com consciência de L2 | **4.386** |
 | cuBLAS (via TensorFlow, com TF32) | 11.946 |
+
+A rasterização segue a blocagem de L2 do Goto na forma que uma GPU permite: não
+se controla a cache, controla-se a **ordem em que os blocos a visitam**. Em vez
+de percorrer a grade em linha, agrupam-se 8 linhas de blocos, de modo que os
+painéis compartilhados ainda estejam na L2 quando forem reusados. Medido em
+4096³, em três execuções: **+5,1%, +5,9% e +5,1%** sobre o percurso em linha, com
+a curva subindo até o grupo 8–16 e colapsando em 32 — o formato esperado de
+quando o grupo deixa de caber na cache.
 
 O bloco `8×8` por thread, que o cuBLAS usa, foi implementado e medido **5% mais
 lento** — a sonda `examples/ocupacao.rs` explica por quê: aritmética pura

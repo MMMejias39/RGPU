@@ -63,7 +63,7 @@
 //! Cada mapeamento de carga é escolhido para que threads vizinhas leiam
 //! endereços vizinhos — sem isso a coalescência se perde e o ganho evapora.
 pub const MM_FAST: &str = r#"
-struct Dims { m: u32, n: u32, k: u32, pad: u32 };
+struct Dims { m: u32, n: u32, k: u32, grid_x: u32, grupo: u32, p0: u32, p1: u32, p2: u32 };
 @group(0) @binding(0) var<uniform> d: Dims;
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
@@ -203,11 +203,48 @@ fn escreve(linha0: u32, col0: u32, acc: array<vec4<f32>, 4>) {
 
 fn passos() -> u32 { return (d.k + TK - 1u) / TK; }
 
+// Ordem de percurso dos blocos, com consciência de L2.
+//
+// A grade é despachada linearmente e o índice do bloco é reconstruído aqui, em
+// vez de vir direto de `workgroup_id`. Percorrer em linha — o padrão — faz
+// blocos vizinhos compartilharem o painel de `A` mas nunca o de `B`: ao chegar
+// na linha seguinte, os painéis de `B` já saíram da L2 e são relidos.
+//
+// Agrupando `grupo` linhas e descendo dentro do grupo antes de avançar coluna,
+// blocos consecutivos passam a compartilhar o painel de `B`, e os `grupo`
+// painéis de `A` ficam residentes enquanto o grupo é varrido. É a blocagem de
+// L2 do Goto, na forma que uma GPU permite: não se controla a cache, controla-se
+// a ordem em que os blocos a visitam.
+//
+// `grupo = 1` reproduz exatamente o percurso em linha, o que torna a comparação
+// entre os dois uma troca de uniforme, sem recompilar.
+fn bloco(w: vec3<u32>) -> vec2<u32> {
+    let pid = w.y * d.grid_x + w.x;
+    let nm = (d.m + TM - 1u) / TM;
+    let nn = (d.n + TN - 1u) / TN;
+    let grupo = max(d.grupo, 1u);
+    let por_grupo = grupo * nn;
+    let gid = pid / por_grupo;
+    let m0 = gid * grupo;
+    let tam = max(min(nm - m0, grupo), 1u);
+    return vec2<u32>(m0 + (pid % tam), (pid % por_grupo) / tam);
+}
+
+fn fora(w: vec3<u32>) -> bool {
+    let pid = w.y * d.grid_x + w.x;
+    let nm = (d.m + TM - 1u) / TM;
+    let nn = (d.n + TN - 1u) / TN;
+    return pid >= nm * nn;
+}
+
+
 @compute @workgroup_size(16, 16)
 fn mm(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    if (fora(w)) { return; }
     let tid = l.y * 16u + l.x;
-    let lin0 = w.y * TM;
-    let col0 = w.x * TN;
+    let b_id = bloco(w);
+    let lin0 = b_id.x * TM;
+    let col0 = b_id.y * TN;
     var acc = array<vec4<f32>, 4>();
     let n = passos();
 
@@ -237,9 +274,11 @@ fn mm(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3
 
 @compute @workgroup_size(16, 16)
 fn mm_atb(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    if (fora(w)) { return; }
     let tid = l.y * 16u + l.x;
-    let lin0 = w.y * TM;
-    let col0 = w.x * TN;
+    let b_id = bloco(w);
+    let lin0 = b_id.x * TM;
+    let col0 = b_id.y * TN;
     var acc = array<vec4<f32>, 4>();
     let n = passos();
 
@@ -269,9 +308,11 @@ fn mm_atb(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: 
 
 @compute @workgroup_size(16, 16)
 fn mm_abt(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    if (fora(w)) { return; }
     let tid = l.y * 16u + l.x;
-    let lin0 = w.y * TM;
-    let col0 = w.x * TN;
+    let b_id = bloco(w);
+    let lin0 = b_id.x * TM;
+    let col0 = b_id.y * TN;
     var acc = array<vec4<f32>, 4>();
     let n = passos();
 
@@ -329,7 +370,7 @@ fn mm_abt(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: 
 /// `flag_relu` no uniforme distingue camada oculta (com ReLU) de camada de
 /// saída (só o viés), para que um kernel sirva às duas.
 pub const MM_EPILOGO: &str = r#"
-struct Dims { m: u32, n: u32, k: u32, flag_relu: u32 };
+struct Dims { m: u32, n: u32, k: u32, grid_x: u32, grupo: u32, flag_relu: u32, p0: u32, p1: u32 };
 @group(0) @binding(0) var<uniform> d: Dims;
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
@@ -374,11 +415,47 @@ fn escreve(linha0: u32, col0: u32, acc: array<vec4<f32>, 4>) {
     guarda(linha0 + 3u, col0 + 3u, acc[3].w);
 }
 
+// Ordem de percurso dos blocos, com consciência de L2.
+//
+// A grade é despachada linearmente e o índice do bloco é reconstruído aqui, em
+// vez de vir direto de `workgroup_id`. Percorrer em linha — o padrão — faz
+// blocos vizinhos compartilharem o painel de `A` mas nunca o de `B`: ao chegar
+// na linha seguinte, os painéis de `B` já saíram da L2 e são relidos.
+//
+// Agrupando `grupo` linhas e descendo dentro do grupo antes de avançar coluna,
+// blocos consecutivos passam a compartilhar o painel de `B`, e os `grupo`
+// painéis de `A` ficam residentes enquanto o grupo é varrido. É a blocagem de
+// L2 do Goto, na forma que uma GPU permite: não se controla a cache, controla-se
+// a ordem em que os blocos a visitam.
+//
+// `grupo = 1` reproduz exatamente o percurso em linha, o que torna a comparação
+// entre os dois uma troca de uniforme, sem recompilar.
+fn bloco(w: vec3<u32>) -> vec2<u32> {
+    let pid = w.y * d.grid_x + w.x;
+    let nm = (d.m + TM - 1u) / TM;
+    let nn = (d.n + TN - 1u) / TN;
+    let grupo = max(d.grupo, 1u);
+    let por_grupo = grupo * nn;
+    let gid = pid / por_grupo;
+    let m0 = gid * grupo;
+    let tam = max(min(nm - m0, grupo), 1u);
+    return vec2<u32>(m0 + (pid % tam), (pid % por_grupo) / tam);
+}
+
+fn fora(w: vec3<u32>) -> bool {
+    let pid = w.y * d.grid_x + w.x;
+    let nm = (d.m + TM - 1u) / TM;
+    let nn = (d.n + TN - 1u) / TN;
+    return pid >= nm * nn;
+}
+
 @compute @workgroup_size(16, 16)
 fn mm_bias(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    if (fora(w)) { return; }
     let tid = l.y * 16u + l.x;
-    let lin0 = w.y * TM;
-    let col0 = w.x * TN;
+    let b_id = bloco(w);
+    let lin0 = b_id.x * TM;
+    let col0 = b_id.y * TN;
     var acc = array<vec4<f32>, 4>();
 
     let passos = (d.k + TK - 1u) / TK;

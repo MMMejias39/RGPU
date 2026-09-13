@@ -48,9 +48,22 @@ fn main() {
     gpu.set_fast_gemm(false);
     let lento = medir(&gpu, &ta, &tb, m, n, reps);
     gpu.set_fast_gemm(true);
-    let rapido = medir(&gpu, &ta, &tb, m, n, reps);
 
-    println!("ingênuo (16×16, 1 elem/thread) : {:>8.3} s   {:>8.1} GFLOP/s", lento, gflop / lento);
-    println!("ladrilhado (64×64, 4×4/thread) : {:>8.3} s   {:>8.1} GFLOP/s", rapido, gflop / rapido);
-    println!("ganho                          : {:>8.2}×", lento / rapido);
+    println!("ingênuo (16×16, 1 elem/thread) : {:>8.3} s   {:>8.1} GFLOP/s\n", lento, gflop / lento);
+
+    // `grupo = 1` é o percurso em linha; os demais agrupam linhas de blocos para
+    // que os painéis compartilhados ainda estejam na L2 quando forem reusados.
+    println!("{:>8} {:>12} {:>12} {:>10}", "grupo", "s", "GFLOP/s", "vs linha");
+    let mut base = 0.0;
+    for grupo in [1u32, 2, 4, 8, 16, 32] {
+        gpu.set_grupo_l2(grupo);
+        let t = medir(&gpu, &ta, &tb, m, n, reps);
+        let g = gflop / t;
+        if grupo == 1 {
+            base = g;
+        }
+        let rotulo = if grupo == 1 { "  (linha)".to_string() } else { format!("{:+8.1}%", 100.0 * (g / base - 1.0)) };
+        println!("{grupo:>8} {t:>12.4} {g:>12.1} {rotulo:>10}");
+    }
+    gpu.set_grupo_l2(8);
 }

@@ -90,9 +90,11 @@ quase ninguém mede.
 
 ## Ordem sugerida
 
-1. **Rasterização de blocos com consciência de L2** — é a blocagem que falta na
-   hierarquia, é o que Goto identificou como o ponto central, e não custa
-   precisão.
+1. ~~**Rasterização de blocos com consciência de L2**~~ — **feito**, +5 a 6% em
+   4096³, com curva reproduzível. Foi a primeira otimização em quatro tentativas
+   a render, e a única que atacava a hierarquia de memória em vez do laço
+   interno. `Gpu::set_grupo_l2` expõe o parâmetro; `1` reproduz o percurso em
+   linha para comparação.
 2. **Strassen de um nível** — 12,5% menos multiplicações, com ganho medido de
    20–32% na literatura de GPU, e um custo de precisão que este repositório tem
    como quantificar.

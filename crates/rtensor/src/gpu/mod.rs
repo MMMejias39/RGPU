@@ -62,7 +62,15 @@ struct Dims {
     m: u32,
     n: u32,
     k: u32,
-    pad: u32,
+    /// Largura da grade despachada: o kernel reconstrói o índice linear do
+    /// bloco a partir dela, para poder escolher a ordem de percurso.
+    grid_x: u32,
+    /// Quantas linhas de blocos são varridas antes de avançar de coluna.
+    /// `1` reproduz o percurso em linha.
+    grupo: u32,
+    p0: u32,
+    p1: u32,
+    p2: u32,
 }
 
 #[repr(C)]
@@ -169,6 +177,8 @@ pub struct Gpu {
     colsum: wgpu::ComputePipeline,
     adam: wgpu::ComputePipeline,
     fast_gemm: bool,
+    /// Linhas de blocos por grupo na rasterização. Ver `gemm::bloco`.
+    grupo_l2: u32,
     perfil: Option<Perfil>,
 }
 
@@ -309,6 +319,7 @@ impl Gpu {
             colsum: pipe(kernels::COLSUM, "colsum", "colsum"),
             adam: pipe(kernels::ADAM, "adam", "adam"),
             fast_gemm: true,
+            grupo_l2: 8,
             perfil,
             info: etiqueta,
             device,
@@ -338,6 +349,16 @@ impl Gpu {
 
     pub fn fast_gemm(&self) -> bool {
         self.fast_gemm
+    }
+
+    /// Quantas linhas de blocos a rasterização varre antes de avançar de
+    /// coluna. `1` volta ao percurso em linha; o padrão é 8.
+    pub fn set_grupo_l2(&mut self, grupo: u32) {
+        self.grupo_l2 = grupo.max(1);
+    }
+
+    pub fn grupo_l2(&self) -> u32 {
+        self.grupo_l2
     }
 
     fn pipeline(&self, k: Kernel) -> &wgpu::ComputePipeline {
@@ -535,12 +556,22 @@ impl Gpu {
         rotulo: &'static str,
     ) -> Op {
         let (kernel, ladrilho) = if self.fast_gemm { (rapido, 64) } else { (lento, 16) };
+        let (gx, gy, grupo) = self.grade_blocos(m, n, ladrilho);
         self.montar(
             kernel,
-            Dims { m: m as u32, n: n as u32, k: k as u32, pad: 0 },
+            Dims {
+                m: m as u32,
+                n: n as u32,
+                k: k as u32,
+                grid_x: gx,
+                grupo,
+                p0: 0,
+                p1: 0,
+                p2: 0,
+            },
             &[&a.buf, &b.buf, &c.buf],
-            n.div_ceil(ladrilho) as u32,
-            m.div_ceil(ladrilho) as u32,
+            gx,
+            gy,
             rotulo,
         )
     }
@@ -563,6 +594,22 @@ impl Gpu {
         self.op_mm(Kernel::MmAbt, Kernel::MmAbtF, a, b, c, m, n, k, "matmul_a_bt")
     }
 
+    /// Grade de despacho para `m×n` blocos: linear, dobrada em 2-D porque cada
+    /// dimensão vai só até 65535. Devolve `(x, y, grupo)`.
+    ///
+    /// O kernel ingênuo não rasteriza — ele lê o bloco direto do `workgroup_id`
+    /// —, então recebe `grupo = 1` e a grade na forma original.
+    fn grade_blocos(&self, m: usize, n: usize, ladrilho: usize) -> (u32, u32, u32) {
+        let nm = m.div_ceil(ladrilho);
+        let nn = n.div_ceil(ladrilho);
+        if ladrilho == 16 {
+            return (nn as u32, nm as u32, 1);
+        }
+        let total = nm * nn;
+        let (gx, gy) = Self::grade(total);
+        (gx, gy, self.grupo_l2)
+    }
+
     /// `C = X W + 1ₙb`, com ReLU opcional aplicada ainda em registradores.
     ///
     /// Substitui a sequência `matmul` + `bias_add` + `relu` por um dispatch só.
@@ -576,17 +623,22 @@ impl Gpu {
         relu: bool,
     ) -> Op {
         let (m, k, n) = (a.shape[0], a.shape[1], b.shape[1]);
+        let (gx, gy, grupo) = self.grade_blocos(m, n, 64);
         self.montar(
             Kernel::MmBias,
             Dims {
                 m: m as u32,
                 n: n as u32,
                 k: k as u32,
-                pad: u32::from(relu),
+                grid_x: gx,
+                grupo,
+                p0: u32::from(relu),
+                p1: 0,
+                p2: 0,
             },
             &[&a.buf, &b.buf, &c.buf, &vies.buf],
-            n.div_ceil(64) as u32,
-            m.div_ceil(64) as u32,
+            gx,
+            gy,
             if relu { "mm_bias_relu" } else { "mm_bias" },
         )
     }
