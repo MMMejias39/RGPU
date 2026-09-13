@@ -30,6 +30,18 @@
 //! disponíveis. E como escrever no buffer ocioso não conflita com ler o ativo,
 //! o padrão também reduz de duas para **uma barreira por iteração**.
 //!
+//! # Padding contra conflito de bancos
+//!
+//! A memória compartilhada tem 32 bancos de 4 bytes, e o banco de um endereço é
+//! `(endereço/4) % 32`. Com o ladrilho de `A` guardado com passo `TM = 64`, a
+//! escrita `sa[(idx%16)*64 + idx/16]` faz as 16 primeiras threads de um warp
+//! endereçarem 0, 64, 128, … 960 — todos múltiplos de 32, **todos no banco 0**.
+//! São 16 vias de conflito, e o hardware serializa os 16 acessos.
+//!
+//! Basta um elemento de padding: com passo `65`, os mesmos endereços viram
+//! 0, 65, 130, … e caem nos bancos 0, 1, 2, … — um por banco, sem conflito. O
+//! custo é 16 floats por ladrilho, e nada muda na aritmética.
+//!
 //! As três variantes diferem apenas em como preenchem os ladrilhos:
 //!
 //! - `mm`      — `A[M,K] · B[K,N]`
@@ -49,10 +61,12 @@ const TM: u32 = 64u;
 const TN: u32 = 64u;
 const TK: u32 = 16u;
 const THREADS: u32 = 256u;
-const BUF: u32 = 1024u;   // um ladrilho; há dois, alternados
+// Passo de linha com um elemento de padding: quebra o conflito de bancos.
+const LD: u32 = 65u;
+const BUF: u32 = 1040u;   // TK * LD; há dois ladrilhos, alternados
 
-var<workgroup> sa: array<f32, 2048>;
-var<workgroup> sb: array<f32, 2048>;
+var<workgroup> sa: array<f32, 2080>;
+var<workgroup> sb: array<f32, 2080>;
 
 // --- leituras globais, uma por variante ---------------------------------
 
@@ -112,28 +126,28 @@ fn le_b_nk(tid: u32, col0: u32, t: u32) -> vec4<f32> {
 fn guarda_a_mk(tid: u32, buf: u32, r: vec4<f32>) {
     for (var i = 0u; i < 4u; i = i + 1u) {
         let idx = tid + i * THREADS;
-        sa[buf * BUF + (idx % TK) * TM + idx / TK] = r[i];
+        sa[buf * BUF + (idx % TK) * LD + idx / TK] = r[i];
     }
 }
 
 fn guarda_a_km(tid: u32, buf: u32, r: vec4<f32>) {
     for (var i = 0u; i < 4u; i = i + 1u) {
         let idx = tid + i * THREADS;
-        sa[buf * BUF + (idx / TM) * TM + idx % TM] = r[i];
+        sa[buf * BUF + (idx / TM) * LD + idx % TM] = r[i];
     }
 }
 
 fn guarda_b_kn(tid: u32, buf: u32, r: vec4<f32>) {
     for (var i = 0u; i < 4u; i = i + 1u) {
         let idx = tid + i * THREADS;
-        sb[buf * BUF + (idx / TN) * TN + idx % TN] = r[i];
+        sb[buf * BUF + (idx / TN) * LD + idx % TN] = r[i];
     }
 }
 
 fn guarda_b_nk(tid: u32, buf: u32, r: vec4<f32>) {
     for (var i = 0u; i < 4u; i = i + 1u) {
         let idx = tid + i * THREADS;
-        sb[buf * BUF + (idx % TK) * TN + idx / TK] = r[i];
+        sb[buf * BUF + (idx % TK) * LD + idx / TK] = r[i];
     }
 }
 
@@ -141,8 +155,8 @@ fn guarda_b_nk(tid: u32, buf: u32, r: vec4<f32>) {
 
 fn acumula(buf: u32, ty: u32, tx: u32, acc: ptr<function, array<vec4<f32>, 4>>) {
     for (var kk = 0u; kk < TK; kk = kk + 1u) {
-        let ab = buf * BUF + kk * TM + ty * 4u;
-        let bb = buf * BUF + kk * TN + tx * 4u;
+        let ab = buf * BUF + kk * LD + ty * 4u;
+        let bb = buf * BUF + kk * LD + tx * 4u;
         let av = vec4<f32>(sa[ab], sa[ab + 1u], sa[ab + 2u], sa[ab + 3u]);
         let bv = vec4<f32>(sb[bb], sb[bb + 1u], sb[bb + 2u], sb[bb + 3u]);
         (*acc)[0] = (*acc)[0] + av.x * bv;
@@ -314,9 +328,10 @@ const TM: u32 = 64u;
 const TN: u32 = 64u;
 const TK: u32 = 16u;
 const THREADS: u32 = 256u;
+const LD: u32 = 65u;   // padding contra conflito de bancos
 
-var<workgroup> sa: array<f32, 1024>;
-var<workgroup> sb: array<f32, 1024>;
+var<workgroup> sa: array<f32, 1040>;
+var<workgroup> sb: array<f32, 1040>;
 
 fn epilogo(v: f32, col: u32) -> f32 {
     let z = v + vies[col];
@@ -362,7 +377,7 @@ fn mm_bias(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w:
             let kx = idx % TK;
             let gr = lin0 + mm_;
             let gk = t * TK + kx;
-            sa[kx * TM + mm_] = select(0.0, a[gr * d.k + gk], gr < d.m && gk < d.k);
+            sa[kx * LD + mm_] = select(0.0, a[gr * d.k + gk], gr < d.m && gk < d.k);
         }
         for (var i = 0u; i < 4u; i = i + 1u) {
             let idx = tid + i * THREADS;
@@ -370,12 +385,12 @@ fn mm_bias(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w:
             let nn = idx % TN;
             let gk = t * TK + kx;
             let gc = col0 + nn;
-            sb[kx * TN + nn] = select(0.0, b[gk * d.n + gc], gk < d.k && gc < d.n);
+            sb[kx * LD + nn] = select(0.0, b[gk * d.n + gc], gk < d.k && gc < d.n);
         }
         workgroupBarrier();
         for (var kk = 0u; kk < TK; kk = kk + 1u) {
-            let ab = kk * TM + l.y * 4u;
-            let bb = kk * TN + l.x * 4u;
+            let ab = kk * LD + l.y * 4u;
+            let bb = kk * LD + l.x * 4u;
             let av = vec4<f32>(sa[ab], sa[ab + 1u], sa[ab + 2u], sa[ab + 3u]);
             let bv = vec4<f32>(sb[bb], sb[bb + 1u], sb[bb + 2u], sb[bb + 3u]);
             acc[0] = acc[0] + av.x * bv;
