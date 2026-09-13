@@ -309,6 +309,38 @@ Nenhum dos dois publica joules por porta. O número do cuStateVec acima foi
 medido por fora, com `rqubit/examples/medir_externo.rs` — o instrumento mede
 qualquer processo, não só o nosso.
 
+### Circuito completo, com fusão nos dois lados
+
+Quatro camadas de rotações e CNOTs em cadeia — o formato de algoritmo
+variacional. Milissegundos por circuito, precisão simples:
+
+| Qubits | rqubit direto | **rqubit fundido** | cuStateVec | Aer (fusão on) | Aer (fusão off) |
+|---:|---:|---:|---:|---:|---:|
+| 20 | 18,97 | 8,22 | **6,30** | 51,87 | 38,11 |
+| 22 | 68,10 | **20,79** | 27,25 | 270,40 | 257,89 |
+| 24 | 375,25 | **122,32** | 298,21 | 1.194,93 | 1.145,05 |
+| 26 | 1.567,93 | **510,83** | 1.296,30 | 4.094,71 | 5.641,44 |
+
+Três leituras:
+
+**Contra o cuStateVec, o kernel deles é ~21% mais rápido** que o nosso neste
+circuito — 1.296 contra 1.568 ms sem fusão em 26 qubits. Mas o `cuStateVec` é
+API de baixo nível e **não funde portas**: isso é responsabilidade de quem
+chama. Com a nossa fusão, 510,8 contra 1.296,3 — **2,5× mais rápido**, apesar do
+kernel mais lento.
+
+*Ressalva:* a NVIDIA tem APIs de nível mais alto (`cutensornet`) que fariam essa
+otimização. A comparação é do que cada API entrega, não do teto de cada pilha.
+
+**A fusão do Aer quase não ajuda aqui** — 1,0× a 1,38×, e em 20 a 24 qubits
+chega a atrapalhar. A nossa dá 3,07×. A diferença é de estratégia: o Aer funde
+em unitárias de até 5 qubits, o que na CPU troca passadas de memória por muita
+aritmética; nós só absorvemos portas de um qubit dentro das de dois, o que numa
+GPU limitada por banda ganha sempre.
+
+**Contra o Aer, 8,0× em 26 qubits** — mas é GPU contra CPU, e isso era
+esperado.
+
 Duas armadilhas que invalidariam a comparação, e como foram tratadas, estão em
 [`benchmarks/quantum/`](benchmarks/quantum/): portas que se cancelam no
 transpilador, e a fusão de portas do Aer.

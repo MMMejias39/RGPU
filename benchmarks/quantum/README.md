@@ -46,6 +46,8 @@ comparação com `fusion_enable=on` deixou de ser assimétrica.
 |---|---|
 | `bench_aer.py` | `bench_aer.py <qubits> <portas> <CPU\|GPU> <on\|off> <single\|double>` |
 | `bench_custatevec.py` | `bench_custatevec.py <qubits> <portas> <single\|double>` |
+| `bench_aer_camadas.py` | Circuito em camadas, igual ao de `bench_fusao.rs` |
+| `bench_custatevec_camadas.py` | O mesmo circuito, no cuStateVec |
 
 ## Energia
 
