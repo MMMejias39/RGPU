@@ -135,6 +135,47 @@ struct PortaP {
     u1: [f32; 4],
 }
 
+/// Precisão de armazenamento das amplitudes.
+///
+/// A aritmética da porta é sempre `f32`; o que muda é como as amplitudes ficam
+/// guardadas entre uma porta e a seguinte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precisao {
+    /// `complex64`: dois `f32`, 8 bytes por amplitude.
+    F32,
+    /// `complex32`: dois `f16` empacotados numa palavra, 4 bytes por amplitude.
+    ///
+    /// Metade do tráfego numa carga que mede 83% da banda da placa, e **dois
+    /// qubits a mais** dentro do limite de 2 GB por binding. O custo é
+    /// precisão: `f16` guarda ~3 dígitos decimais, e o erro se acumula a cada
+    /// porta — `tests/porta1.rs` mede quanto.
+    F16,
+}
+
+impl Precisao {
+    pub fn bytes_por_amplitude(&self) -> usize {
+        match self {
+            Precisao::F32 => 8,
+            Precisao::F16 => 4,
+        }
+    }
+
+    /// Teto de qubits imposto pelo limite de binding do WebGPU.
+    ///
+    /// O limite é 2 GB **menos 4 bytes** — `2147483644`. Um estado de 29 qubits
+    /// em meia precisão ocupa exatamente 2 GB e falha por esses 4 bytes; o de 28
+    /// qubits em precisão simples, pelo mesmo motivo. Medido, não estimado.
+    ///
+    /// Meia precisão compra **um** qubit, não dois: a conta dobra, mas o teto
+    /// também é uma potência de dois.
+    pub fn max_qubits(&self) -> usize {
+        match self {
+            Precisao::F32 => 27,
+            Precisao::F16 => 28,
+        }
+    }
+}
+
 /// Kernel de porta de um qubit.
 ///
 /// Cada thread cuida de **um par** de amplitudes: os índices que diferem apenas
@@ -177,44 +218,122 @@ fn porta1(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: 
 }
 "#;
 
+/// Mesma porta, com as amplitudes guardadas em meia precisão.
+///
+/// As duas metades de cada palavra são a parte real e a imaginária. A aritmética
+/// acontece em `f32`, como no kernel de precisão simples — só o armazenamento
+/// muda, e com ele o tráfego de memória, que é o gargalo aqui.
+const PORTA1_F16: &str = r#"
+struct P {
+    pares: u32, qubit: u32, gx: u32, pad: u32,
+    u0: vec4<f32>,
+    u1: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read_write> psi: array<u32>;
+
+fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+@compute @workgroup_size(256)
+fn porta1(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+    let par = (w.y * p.gx + w.x) * 256u + l.x;
+    if (par >= p.pares) { return; }
+
+    let mascara = (1u << p.qubit) - 1u;
+    let i0 = ((par >> p.qubit) << (p.qubit + 1u)) | (par & mascara);
+    let i1 = i0 | (1u << p.qubit);
+
+    let a0 = unpack2x16float(psi[i0]);
+    let a1 = unpack2x16float(psi[i1]);
+    psi[i0] = pack2x16float(cmul(p.u0.xy, a0) + cmul(p.u0.zw, a1));
+    psi[i1] = pack2x16float(cmul(p.u1.xy, a0) + cmul(p.u1.zw, a1));
+}
+"#;
+
+/// Converte meia precisão para `f32`, incluindo subnormais.
+///
+/// Escrito à mão para manter a crate sem dependências: a `half` faria isto, mas
+/// são quinze linhas.
+fn f16_para_f32(h: u16) -> f32 {
+    let sinal = ((h >> 15) & 1) as u32;
+    let expo = ((h >> 10) & 0x1f) as u32;
+    let frac = (h & 0x3ff) as u32;
+
+    let bits = if expo == 0 {
+        if frac == 0 {
+            sinal << 31
+        } else {
+            // Subnormal: normaliza deslocando até o bit implícito aparecer.
+            let mut e: i32 = -1;
+            let mut f = frac;
+            while f & 0x400 == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            (sinal << 31) | (((113 + e) as u32) << 23) | ((f & 0x3ff) << 13)
+        }
+    } else if expo == 31 {
+        (sinal << 31) | 0x7f80_0000 | (frac << 13)
+    } else {
+        (sinal << 31) | ((expo + 112) << 23) | (frac << 13)
+    };
+    f32::from_bits(bits)
+}
+
 /// Vetor de estado de `n` qubits, residente na GPU.
 pub struct Estado {
     qubits: usize,
+    precisao: Precisao,
     buf: wgpu::Buffer,
     pipeline: wgpu::ComputePipeline,
 }
 
 impl Estado {
-    /// Teto de qubits imposto pelo limite de 2 GB por binding de armazenamento.
-    ///
-    /// Não é limite de VRAM: com 8 bytes por amplitude, 2 GB comportam `2²⁷`
-    /// amplitudes. Medido — 28 qubits falha na criação do bind group.
+    /// Teto de qubits em precisão simples, imposto pelo limite de 2 GB por
+    /// binding. Em meia precisão são 29 — ver [`Precisao::max_qubits`].
     pub const MAX_QUBITS: usize = 27;
 
-    /// Cria o estado `|0…0⟩`: amplitude 1 no índice 0, zero no resto.
+    /// Cria o estado `|0…0⟩` em precisão simples.
     pub fn novo(gpu: &Gpu, qubits: usize) -> Result<Estado, String> {
+        Estado::novo_com(gpu, qubits, Precisao::F32)
+    }
+
+    /// Cria o estado `|0…0⟩`: amplitude 1 no índice 0, zero no resto.
+    pub fn novo_com(gpu: &Gpu, qubits: usize, precisao: Precisao) -> Result<Estado, String> {
         if qubits == 0 {
             return Err("um estado precisa de ao menos um qubit".into());
         }
-        if qubits > Self::MAX_QUBITS {
+        if qubits > precisao.max_qubits() {
             return Err(format!(
-                "{qubits} qubits exigem {} GB num único binding; o WebGPU limita a 2 GB, \
-                 o que dá {} qubits. Passar disso exige repartir o estado entre buffers.",
-                (1usize << qubits) * 8 / (1 << 30),
-                Self::MAX_QUBITS
+                "{qubits} qubits em {precisao:?} exigem {} GB num único binding; o WebGPU \
+                 limita a 2 GB, o que dá {} qubits. Passar disso exige repartir o estado \
+                 entre buffers.",
+                (1usize << qubits) * precisao.bytes_por_amplitude() / (1 << 30),
+                precisao.max_qubits()
             ));
         }
         let amplitudes = 1usize << qubits;
-        // Duas f32 por amplitude.
-        let buf = gpu.buffer_bruto(amplitudes * 2, "psi");
+        let palavras = amplitudes * precisao.bytes_por_amplitude() / 4;
+        let buf = gpu.buffer_bruto(palavras, "psi");
 
-        let mut inicial = vec![0.0f32; amplitudes * 2];
-        inicial[0] = 1.0;
+        // |0…0⟩: amplitude 1 no índice 0. Em meia precisão, 1,0 é 0x3C00 na
+        // metade baixa e 0 na alta — não é preciso converter nada.
+        let mut inicial = vec![0u32; palavras];
+        inicial[0] = match precisao {
+            Precisao::F32 => 1.0f32.to_bits(),
+            Precisao::F16 => 0x3C00,
+        };
         gpu.queue().write_buffer(&buf, 0, bytemuck::cast_slice(&inicial));
 
+        let fonte = match precisao {
+            Precisao::F32 => PORTA1,
+            Precisao::F16 => PORTA1_F16,
+        };
         let modulo = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("porta1"),
-            source: wgpu::ShaderSource::Wgsl(PORTA1.into()),
+            source: wgpu::ShaderSource::Wgsl(fonte.into()),
         });
         let pipeline = gpu
             .device()
@@ -227,11 +346,15 @@ impl Estado {
                 cache: None,
             });
 
-        Ok(Estado { qubits, buf, pipeline })
+        Ok(Estado { qubits, precisao, buf, pipeline })
     }
 
     pub fn qubits(&self) -> usize {
         self.qubits
+    }
+
+    pub fn precisao(&self) -> Precisao {
+        self.precisao
     }
 
     pub fn amplitudes(&self) -> usize {
@@ -240,7 +363,7 @@ impl Estado {
 
     /// Bytes ocupados pelo vetor de estado.
     pub fn bytes(&self) -> usize {
-        self.amplitudes() * 8
+        self.amplitudes() * self.precisao.bytes_por_amplitude()
     }
 
     /// Grava a aplicação de uma porta. Não sincroniza.
@@ -290,9 +413,10 @@ impl Estado {
         passe.dispatch_workgroups(gx, gy, 1);
     }
 
-    /// Baixa as amplitudes para a CPU. Sincroniza.
+    /// Baixa as amplitudes para a CPU, convertendo de meia precisão quando for
+    /// o caso. Sincroniza.
     pub fn baixar(&self, gpu: &Gpu) -> Vec<Complexo> {
-        let bytes = (self.amplitudes() * 8) as u64;
+        let bytes = self.bytes() as u64;
         let leitura = gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("leitura"),
             size: bytes,
@@ -314,9 +438,25 @@ impl Estado {
         rx.recv().expect("canal").expect("map");
 
         let vista = slice.get_mapped_range().expect("range");
-        let cru: Vec<f32> = bytemuck::cast_slice(&vista[..]).to_vec();
+        let saida = match self.precisao {
+            Precisao::F32 => {
+                let cru: Vec<f32> = bytemuck::cast_slice(&vista[..]).to_vec();
+                cru.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+            }
+            Precisao::F16 => {
+                let cru: Vec<u32> = bytemuck::cast_slice(&vista[..]).to_vec();
+                cru.iter()
+                    .map(|w| {
+                        (
+                            f16_para_f32(*w as u16),
+                            f16_para_f32((*w >> 16) as u16),
+                        )
+                    })
+                    .collect()
+            }
+        };
         drop(vista);
-        cru.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+        saida
     }
 }
 

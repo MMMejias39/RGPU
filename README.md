@@ -194,20 +194,32 @@ interno de um simulador é contração tensorial, que é o que o `rtensor` já f
 Aplicar uma porta lê duas amplitudes, multiplica por uma matriz 2×2 e escreve
 duas de volta: **0,875 flop por byte**. É o regime **oposto** ao do GEMM.
 
-| Qubits | Memória | ms/porta | GB/s | µJ/porta |
+| Qubits | Precisão | ms/porta | GB/s | µJ/porta |
 |---:|---:|---:|---:|---:|
-| 20 | 8 MB | 0,087 | 191,9 | 698 |
-| 22 | 32 MB | 0,340 | 197,6 | 8.934 |
-| 24 | 128 MB | 1,314 | 204,2 | 67.352 |
-| 26 | 512 MB | 5,411 | 198,5 | 260.385 |
-| 27 | 1.024 MB | 10,413 | **206,2** | 515.054 |
+| 24 | f32 | 1,473 | 182,2 | 70.255 |
+| 24 | **f16** | **0,693** | 193,7 | **35.432** |
+| 26 | f32 | 5,355 | 200,5 | 261.535 |
+| 26 | **f16** | **2,735** | 196,3 | **138.068** |
+| 27 | f32 | 10,415 | 206,2 | 518.740 |
+| 27 | **f16** | **5,341** | 201,0 | **274.384** |
 
-**83% dos ~256 GB/s da placa** — carga governada por banda, confirmando a
-previsão. É onde a precisão mista, medida como inútil no GEMM, deve render.
+~200 GB/s de **256 disponíveis** — carga governada por banda, como previsto. E
+é aqui que a **precisão mista finalmente paga**: guardar as amplitudes em
+`complex32` dá **~2× de velocidade e ~2× menos energia**, porque metade dos
+bytes numa carga limitada por bytes é metade do trabalho.
 
-O teto de **27 qubits** não é de VRAM: o WebGPU limita um binding de
-armazenamento a 2 GB, e o vetor de estado é um buffer só. 28 qubits falha na
-criação do bind group, com 4 GB de VRAM ainda livres.
+A mesma técnica foi medida como **inútil no GEMM** — +1 a 7% de velocidade e
+energia *pior*. A diferença é o regime: lá o gargalo não era banda, aqui é. É o
+melhor exemplo no repositório de por que o gargalo precisa ser medido antes de
+escolher a otimização.
+
+O custo é precisão: `f16` guarda ~3 dígitos decimais, e o erro medido fica em
+~1,6·10⁻⁴ a 5,8·10⁻⁴ — **sem crescer com o número de portas**, com a norma do
+estado dentro de 0,2% de 1.
+
+O teto de qubits não é de VRAM: o WebGPU limita um binding a 2 GB **menos 4
+bytes**. Isso dá 27 qubits em `f32` e 28 em `f16` — meia precisão compra **um**
+qubit, não dois, porque o teto também é potência de dois.
 
 Nenhum simulador existente — Qiskit Aer, cuQuantum, qsim — publica joules por
 porta. Aqui isso sai de graça, porque o instrumento já existe.

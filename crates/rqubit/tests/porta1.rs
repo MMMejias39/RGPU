@@ -117,3 +117,58 @@ fn portas_preservam_a_norma() {
 fn recusa_qubit_fora_da_faixa() {
     assert!(Estado::novo(&Gpu::new().unwrap_or_else(|_| std::process::exit(0)), 0).is_err());
 }
+
+/// Meia precisão tem de acertar a física, e o quanto ela perde é medido —
+/// `f16` guarda ~3 dígitos decimais, e o erro se acumula a cada porta.
+#[test]
+fn meia_precisao_confere_e_o_erro_acumulado_e_medido() {
+    use rqubit::Precisao;
+    let Some(gpu) = abrir() else { return };
+    const N: usize = 12;
+
+    for portas_por_qubit in [1usize, 4, 16] {
+        let e32 = Estado::novo_com(&gpu, N, Precisao::F32).expect("f32");
+        let e16 = Estado::novo_com(&gpu, N, Precisao::F16).expect("f16");
+        let mut cpu = estado_inicial_cpu(N);
+
+        let mut enc = gpu.encoder();
+        for rodada in 0..portas_por_qubit {
+            for q in 0..N {
+                let porta = Porta1::ry(0.21 + rodada as f32 * 0.09 + q as f32 * 0.013);
+                e32.aplicar(&gpu, &mut enc, &porta, q);
+                e16.aplicar(&gpu, &mut enc, &porta, q);
+                porta.aplicar_cpu(&mut cpu, q);
+            }
+        }
+        gpu.submit(enc);
+
+        let p32 = e32.baixar(&gpu);
+        let p16 = e16.baixar(&gpu);
+        let (err32, err16) = (erro_max(&cpu, &p32), erro_max(&cpu, &p16));
+        let total = portas_por_qubit * N;
+
+        eprintln!(
+            "{total:>3} portas em {N} qubits: f32 {err32:.2e}, f16 {err16:.2e} \
+             ({:.0}× o erro), norma f16 {:.5}",
+            err16 / err32.max(1e-12),
+            norma(&p16)
+        );
+
+        // `f16` tem 11 bits de mantissa: erro relativo ~2⁻¹¹ por operação, que
+        // cresce no máximo com √(portas) numa caminhada de erros independentes.
+        let limite = 10.0 * (total as f32).sqrt() * 2.0f32.powi(-11);
+        assert!(err16 < limite, "{total} portas: erro {err16:.2e} acima de {limite:.2e}");
+        // A física precisa continuar de pé: estado normalizado.
+        assert!((norma(&p16) - 1.0).abs() < 0.02, "norma f16 {}", norma(&p16));
+    }
+}
+
+#[test]
+fn meia_precisao_alcanca_mais_qubits() {
+    use rqubit::Precisao;
+    // O limite de binding dá 27 qubits em f32 e 28 em f16: meia precisão compra
+    // um qubit, não dois, porque o teto também é potência de dois.
+    assert_eq!(Precisao::F32.max_qubits(), 27);
+    assert_eq!(Precisao::F16.max_qubits(), 28);
+    assert_eq!(Precisao::F16.bytes_por_amplitude(), 4);
+}

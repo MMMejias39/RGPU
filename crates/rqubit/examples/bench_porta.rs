@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use rgpu_power::Medidor;
-use rqubit::{Estado, Porta1};
+use rqubit::{Estado, Porta1, Precisao};
 use rtensor::gpu::Gpu;
 
 fn main() {
@@ -29,18 +29,16 @@ fn main() {
     medidor.calibrar_ociosidade(4.0);
 
     println!(
-        "{:>7} {:>10} {:>11} {:>10} {:>11} {:>12}",
-        "qubits", "memória", "ms/porta", "GB/s", "µJ/porta", "portas/s"
+        "{:>7} {:>7} {:>10} {:>11} {:>10} {:>11} {:>12}",
+        "qubits", "prec.", "memória", "ms/porta", "GB/s", "µJ/porta", "portas/s"
     );
 
-    for qubits in [20usize, 22, 24, 26, 27, 28] {
-        // 28 é recusado pelo limite de binding, e o programa segue.
-        let estado = match Estado::novo(&gpu, qubits) {
+    for qubits in [20usize, 22, 24, 26, 27, 28, 29] {
+      for precisao in [Precisao::F32, Precisao::F16] {
+        // Acima do teto de cada precisão o construtor recusa, e o laço segue.
+        let estado = match Estado::novo_com(&gpu, qubits, precisao) {
             Ok(e) => e,
-            Err(e) => {
-                println!("{qubits:>7}  {e}");
-                continue;
-            }
+            Err(_) => continue,
         };
 
         // Hadamard no qubit 0: o padrão de acesso mais próximo possível, com os
@@ -64,22 +62,24 @@ fn main() {
         let n_energia = ((5.0 / por_porta) as usize).clamp(20, 20_000);
         let (_, m) = medidor.medir(|| aplicar(n_energia));
 
-        // Cada par lê 2 amplitudes e escreve 2: 32 bytes por par, e são 2ⁿ⁻¹
-        // pares — logo 2ⁿ × 16 bytes por porta.
-        let bytes = (1u64 << qubits) * 16;
+        // Cada par lê 2 amplitudes e escreve 2, logo o tráfego é
+        // 2ⁿ × 2 × bytes_por_amplitude.
+        let bytes = (1u64 << qubits) * 2 * precisao.bytes_por_amplitude() as u64;
         let uj = m
             .energia_gpu_total_j()
             .map(|j| j / n_energia as f64 * 1e6);
 
         println!(
-            "{:>7} {:>10} {:>11.4} {:>10.1} {:>11} {:>12.0}",
+            "{:>7} {:>7} {:>10} {:>11.4} {:>10.1} {:>11} {:>12.0}",
             qubits,
+            if precisao == Precisao::F32 { "f32" } else { "f16" },
             format!("{} MB", estado.bytes() / (1 << 20)),
             por_porta * 1e3,
             bytes as f64 / por_porta / 1e9,
             uj.map_or("—".into(), |v| format!("{v:.1}")),
             1.0 / por_porta,
         );
+      }
     }
 
     println!(
