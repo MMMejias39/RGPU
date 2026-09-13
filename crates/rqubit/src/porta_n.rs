@@ -178,7 +178,7 @@ impl PortaN {
 /// memória compartilhada, e laços com limite variável que o compilador não
 /// desenrola.
 ///
-[`PORTA3`] e [`PORTA4`] confirmaram o diagnóstico: com índices constantes, o
+/// [`PORTA3`] e [`PORTA4`] confirmaram o diagnóstico: com índices constantes, o
 /// mesmo circuito caiu de 595 para **294 ms** em três qubits, e de 690 para
 /// **204 ms** em quatro. A fusão até 4 passou de pior opção a melhor, com
 /// **7,65×**.
