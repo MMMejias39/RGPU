@@ -216,7 +216,16 @@ pub struct EnergiaGpu {
     pub media_w: f64,
     pub pico_w: f64,
     /// Energia descontada a linha de base ociosa, quando calibrada.
+    ///
+    /// **A linha de base depende do estado da placa.** Uma GPU travada em
+    /// frequência baixa consome menos trabalhando do que a mesma placa ociosa
+    /// no clock padrão, e aí a subtração perde o sentido. Quando isso acontece,
+    /// [`EnergiaGpu::base_suspeita`] fica verdadeiro e este campo não deve ser
+    /// usado — prefira [`EnergiaGpu::total_j`], que não depende de base alguma.
     pub acima_ociosidade_j: Option<f64>,
+    /// Verdadeiro quando a potência média ficou **abaixo** da ociosidade
+    /// calibrada, sinal de que a linha de base não vale para esta medição.
+    pub base_suspeita: bool,
     pub amostras: usize,
 }
 
@@ -233,10 +242,28 @@ pub struct Medicao {
 }
 
 impl Medicao {
-    /// Energia que melhor representa o custo da carga: acima da ociosidade
-    /// quando há calibração, total caso contrário.
+    /// Energia que melhor representa o custo **marginal** da carga: acima da
+    /// ociosidade quando a calibração é válida, total caso contrário.
+    ///
+    /// Cai para a energia total quando a linha de base é suspeita, em vez de
+    /// devolver um número sem sentido.
     pub fn energia_gpu_j(&self) -> Option<f64> {
-        self.gpu.as_ref().map(|g| g.acima_ociosidade_j.unwrap_or(g.total_j))
+        self.gpu.as_ref().map(|g| {
+            if g.base_suspeita {
+                g.total_j
+            } else {
+                g.acima_ociosidade_j.unwrap_or(g.total_j)
+            }
+        })
+    }
+
+    /// Energia total da janela, sem desconto de linha de base.
+    ///
+    /// É a métrica certa para comparar pontos de operação diferentes — clocks,
+    /// por exemplo —, porque a ociosidade muda junto com o ponto de operação e
+    /// deixa de ser uma constante subtraível.
+    pub fn energia_gpu_total_j(&self) -> Option<f64> {
+        self.gpu.as_ref().map(|g| g.total_j)
     }
 
     /// Energia bruta de um domínio RAPL pelo nome
@@ -265,6 +292,12 @@ impl Medicao {
                 ));
                 if let Some(j) = g.acima_ociosidade_j {
                     s.push_str(&format!("  GPU acima da ociosidade: {j:.2} J\n"));
+                }
+                if g.base_suspeita {
+                    s.push_str(
+                        "  aviso: potência média abaixo da ociosidade calibrada —\n\
+                         \x20        a linha de base não vale aqui; use a energia total\n",
+                    );
                 }
             }
             None => s.push_str("  GPU NVIDIA: indisponível\n"),
@@ -418,6 +451,7 @@ impl Medidor {
                 media_w,
                 pico_w,
                 acima_ociosidade_j: self.ociosidade_w.map(|o| (total_j - o * duracao_s).max(0.0)),
+                base_suspeita: self.ociosidade_w.is_some_and(|o| media_w < o),
                 amostras: amostras.len(),
             }
         });

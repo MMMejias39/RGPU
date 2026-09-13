@@ -36,6 +36,14 @@ struct Ponto {
     gflop_j: f64,
 }
 
+// A varredura usa **energia total**, não "acima da ociosidade".
+//
+// A linha de base é função do ponto de operação: uma placa travada em 210 MHz
+// consome menos trabalhando do que a mesma placa ociosa em 1980 MHz, e a
+// subtração vira negativa. Medido nesta máquina: 12,3 W em carga a 210 MHz
+// contra 14,15 W de ociosidade calibrada no clock padrão. Como a base muda
+// junto com o que se quer comparar, ela deixa de ser subtraível.
+
 fn main() {
     if !clock::e_root() {
         eprintln!(
@@ -122,7 +130,7 @@ fn main() {
         });
         drop(trava);
 
-        let Some(energia) = m.energia_gpu_j() else {
+        let Some(energia) = m.energia_gpu_total_j() else {
             println!("{mhz:>5} MHz: medição de energia falhou");
             continue;
         };
@@ -155,9 +163,21 @@ fn main() {
         return;
     }
 
+    let ignorado: Vec<&Ponto> = pontos
+        .iter()
+        .filter(|p| p.efetivo_mhz.is_some_and(|e| e + 20 < p.pedido_mhz))
+        .collect();
+    if !ignorado.is_empty() {
+        println!(
+            "\naviso: o firmware não entregou {} das frequências pedidas —\n\
+             esses pontos são o mesmo ponto de operação, não pontos distintos.",
+            ignorado.len()
+        );
+    }
+
     println!(
         "\n{:>10} {:>10} {:>10} {:>10} {:>10} {:>11} {:>9}",
-        "pedido", "efetivo", "ms/passo", "média W", "J/passo", "GFLOP/s", "GFLOP/J"
+        "pedido", "efetivo", "ms/passo", "média W", "J total", "GFLOP/s", "GFLOP/J"
     );
     for p in &pontos {
         println!(
@@ -187,10 +207,19 @@ fn main() {
     if melhor.pedido_mhz < rapido.pedido_mhz {
         let perda_vel = 100.0 * (1.0 - melhor.gflops / rapido.gflops);
         let ganho_ef = 100.0 * (melhor.gflop_j / rapido.gflop_j - 1.0);
+        let menos_potencia = 100.0 * (1.0 - melhor.media_w / rapido.media_w);
         println!(
             "\nDo ponto mais rápido para o mais eficiente: {perda_vel:.0}% menos\n\
-             velocidade, {ganho_ef:.0}% mais trabalho por joule. É o preço da\n\
-             escalada de frequência, medido."
+             velocidade, {ganho_ef:.0}% mais trabalho por joule, {menos_potencia:.0}% menos\n\
+             potência ({:.1} W contra {:.1} W).",
+            melhor.media_w, rapido.media_w
+        );
+        let ganho_vel = 100.0 * (rapido.gflops / melhor.gflops - 1.0);
+        let ganho_pot = 100.0 * (rapido.media_w / melhor.media_w - 1.0);
+        println!(
+            "Na direção oposta: subir de {} para {} MHz dá {ganho_vel:.0}% de\n\
+             desempenho custando {ganho_pot:.0}% de potência.",
+            melhor.pedido_mhz, rapido.pedido_mhz
         );
     } else {
         println!(
