@@ -25,9 +25,12 @@ Três resultados, cada um medido e reproduzível:
    energia contradisse a de tempo, e nenhum dos frameworks comparados —
    TensorFlow, PyTorch, burn, candle, Qiskit Aer, cuQuantum — publica a segunda.
 
-E uma lição de método que atravessa tudo: **a otimização certa depende do
-regime**, e o regime precisa ser medido antes. A mesma precisão mista é perda de
-10% de energia no GEMM e ganho de 2× na simulação quântica.
+E duas lições de método que atravessam tudo: **a otimização certa depende do
+regime**, e o regime precisa ser medido antes — a mesma precisão mista é perda
+de 10% de energia no GEMM e ganho de 2× na simulação quântica. E o diagnóstico
+precisa ser conferido contra o que o hardware realmente anuncia: a matriz
+cooperativa, arquivada como "não funcional", funcionava — a configuração
+testada não existia na placa.
 
 ## Desempenho
 
@@ -194,10 +197,51 @@ Ainda 2,7× atrás do cuBLAS. Mas com o TF32 desligado o TensorFlow cai só 12%,
 que localiza a maior parte da diferença em pipelining, tiling multinível e
 swizzling — todos ao alcance do WGSL — e não nos tensor cores.
 
+### Tensor cores (matriz cooperativa)
+
+A técnica que restava da lista — um ladrilho inteiro por instrução — estava
+registrada como **não funcional**, e o registro estava errado. A sonda original
+fixava `8×8 f32`, configuração que esta placa **não anuncia**:
+`cooperative_matrix_properties()` só lista combinações com `f16` em A e B.
+Configuração fora da lista é comportamento indefinido — e os zeros vinham daí,
+não de um bug de driver. Nas configurações anunciadas (`16×16`, operandos
+`f16`), a cadeia inteira funciona: oito variantes com erro máximo **zero**
+(`examples/probe_coop_f16.rs`), de buffer de armazenamento e de memória de
+workgroup, com workgroup de 32 e de 256 threads.
+
+O kernel GEMM cooperativo (`examples/bench_coop.rs`) — ladrilho de saída 64×64
+por workgroup de 256 threads (8 subgrupos), dois ladrilhos de 16×16 por
+subgrupo, `K` em passos de 16 com estagiagem em memória de workgroup, `f16` em
+A e B com acumulador `f32`:
+
+| `N` | cooperativo | escalar | ganho |
+|---|---:|---:|---:|
+| 2048³ | 4.369–4.466 | 4.386 | par |
+| 4096³ | 5.756–5.988 | 3.804–4.243 | **+37% a +50%** |
+
+O ganho vai além da banda: a precisão mista sozinha rendera +1 a 7% no kernel
+escalar, e aqui são ~40% — os tensor cores somam aritmética de verdade. E o
+erro é o esperado da conversão `f16` (~1e-5 relativo), sem acumulação visível.
+
+Dois preços, e agora são os únicos obstáculos:
+
+1. **`unsafe`.** Habilitar a feature exige `ExperimentalFeatures::enabled()`,
+   que é `unsafe fn` — custaria a propriedade "zero `unsafe`" do projeto.
+2. **Operandos em `f16`.** Não há configuração com operandos `f32` anunciada
+   nesta placa.
+
+No caminho houve um bug do naga 30.0.1 — `coopLoad`/`coopStore` com ponteiro
+dinâmico para buffer de armazenamento derrubam o compilador SPIR-V
+(`Expression is not cached!`); para memória de workgroup o mesmo padrão
+funciona. O contorno é a saída por slots de workgroup com cópias planas, custo
+de ~6%. Detalhes, incluindo um artefato de medição cometido e registrado no
+percurso, em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+
 ### Reproduzindo
 
 ```bash
 cargo run -p rtensor --release --features gpu --example suite -- batch   # rtensor
+cargo run -p rtensor --release --features gpu --example bench_coop       # GEMM nos tensor cores
 cd benchmarks/rivais && cargo run --release --bin burn_bench -- 512      # burn
 cd benchmarks/rivais && cargo run --release --bin candle_bench -- 512    # candle
 ```
@@ -524,7 +568,7 @@ desde a mitigação do PLATYPUS (2020).
 ## Rodando
 
 ```bash
-cargo test --workspace --features rtensor/gpu   # 50 testes em 9 suítes
+cargo test --workspace --features rtensor/gpu   # 52 testes em 9 suítes
 cargo test -p rtensor                           # núcleo, sem GPU
 ```
 
@@ -535,6 +579,7 @@ cargo run -p rtensor --release --features gpu --example suite -- batch  # varred
 cargo run -p rtensor --release --features gpu --example bench_gemm      # GEMM, com varreduras
 cargo run -p rtensor --release --features gpu --example perfil          # perfilamento por kernel
 cargo run -p rtensor --release --features gpu --example ocupacao         # pressão de registradores
+cargo run -p rtensor --release --features gpu --example probe_coop_f16   # matriz cooperativa nas configurações anunciadas
 ```
 
 Energia:
@@ -560,10 +605,45 @@ custaram mais tempo que os erros de código, estão em
 [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md). Publicar só os acertos
 falsificaria a taxa de sucesso real do trabalho.
 
-São **onze** otimizações que não pagaram, cada uma com números e causa
+Resumo das tentativas, com o estado atual:
+
+| Tentativa | Resultado medido | Estado |
+|---|---|---|
+| **Rendeu** | | |
+| Buffer duplo no GEMM | +22% em 2048³ | em produção |
+| Rasterização com consciência de L2 | +5 a 6% em 4096³ | em produção |
+| Split-K | **+12,6× a 21,4×** em formas K-dominantes | em produção, e por forma no treino |
+| Strassen de um nível | +11 a 13% acima de 4096³; −52% abaixo | opcional, explícito |
+| Cache de bind groups e uniformes | +8% | em produção |
+| Fusão de portas, 1–2 qubits | 2,7× a 3,1× em tempo e energia | padrão no `rqubit` |
+| Fusão, kernels especializados 3–5 qubits | 5,3× a 9,95× | em produção; o pico é 5 qubits |
+| Precisão mista `f16` (simulador) | ~2× em tempo e energia | padrão no `rqubit` |
+| **Não rendeu** | | |
+| Fusão de kernels no epílogo do GEMM | −20% na rede profunda | registrada |
+| Fundir dispatches num só compute pass | −23% na rede profunda | registrada |
+| Bloco 8×8 por thread | −5% | [revertido](experimentos/gemm-8x8/) |
+| Bloco 8×4 por thread | nulo | [revertido](experimentos/gemm-8x4/) |
+| Leituras globais `vec4` | nulo | [revertido](experimentos/gemm-vec4/) |
+| GEMM especializado para formas alinhadas | nulo | [revertido](experimentos/gemm-alinhado/) |
+| Padding contra conflito de bancos | nulo | mantido, sem crédito |
+| Fusão genérica em 3 e 4 qubits | −9% e −22% apesar de menos portas | substituída pelas especializadas |
+| Precisão mista `f16` (GEMM) | +1 a 7% de velocidade, −5 a 11% de energia | mantida por capacidade, não por velocidade |
+| **Retificado** | | |
+| Matriz cooperativa (tensor cores) | "não funcional" era diagnóstico errado: **funciona**, +37 a +50% em 4096³ | decisão pendente: exige `unsafe` e operandos `f16` |
+
+São **dez** otimizações que não pagaram, cada uma com números e causa
 identificada, ao lado das que pagaram. O código revertido fica preservado em
 [`experimentos/`](experimentos/), para que ninguém refaça a tentativa e para
 que quem discordar de uma rejeição possa medir.
+
+E um registro foi **retificado**: a matriz cooperativa, arquivada como "não
+funcional", funcionava — a sonda usava uma configuração que a placa não
+anuncia, e configuração fora da lista é comportamento indefinido. A retificação
+tem números próprios (seção "Tensor cores" acima) e é a melhor defesa deste
+repositório do método: o registro é verificável, inclusive quando o erro é do
+registro. Também entrou aí um achado colateral: a referência de `f16` do
+`rqubit` devolvia metade dos valores nos subnormais — corrigida com teste
+fixado.
 
 O roteiro do GEMM, com o que a literatura clássica indicou e o que sobrou por
 fazer, está em [ROTEIRO-GEMM.md](ROTEIRO-GEMM.md).
