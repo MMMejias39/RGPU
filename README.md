@@ -56,6 +56,30 @@ cargo run -p rtensor --release --features gpu --example eficiencia   # a tabela 
 cargo run -p rtensor --release --features gpu --example energia      # joules por motor e por fabricante
 ```
 
+### Entre fabricantes, o mesmo código
+
+Mesmo WGSL nas duas GPUs, energia acima da ociosidade, lote 512:
+
+| Motor | ms/passo | J/passo | GFLOP/s | GFLOP/J |
+|---|---:|---:|---:|---:|
+| RTX 4070 Laptop | 1,92 | 0,0874 | 2.535 | **55,64** |
+| Intel Arc (iGPU) | 12,69 | 0,1038 | 383 | **46,85** |
+| CPU, 1 núcleo | 156,48 | 2,2574 | 31 | **2,15** |
+
+A placa dedicada é **6,6× mais rápida** que a gráfica integrada, e apenas
+**19% mais eficiente por joule**. A vantagem da GPU discreta é velocidade,
+quase nada é eficiência energética — e ela ainda consome **11,89 W só por
+estar ligada**, sem trabalho algum.
+
+O salto de eficiência acontece ao sair da CPU para *qualquer* GPU: a iGPU é
+26× mais eficiente que um núcleo de CPU. O salto da integrada para a dedicada
+é de velocidade.
+
+*Ressalva:* o `nvidia-smi` mede a placa inteira (GPU, VRAM, regulação); o
+domínio `uncore` do RAPL cobre só a iGPU dentro do SoC, sem sua parcela de
+controlador de memória e LPDDR. O número da Arc está provavelmente
+subestimado, o que reforça a conclusão em vez de enfraquecê-la.
+
 ### Limites desta máquina
 
 Varrer o **limite de potência** (`nvidia-smi -pl`) não é possível em GPU de

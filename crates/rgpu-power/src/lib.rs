@@ -222,7 +222,12 @@ pub struct EnergiaGpu {
 pub struct Medicao {
     pub duracao_s: f64,
     pub gpu: Option<EnergiaGpu>,
+    /// Energia bruta por domínio RAPL na janela.
     pub rapl_j: Vec<(String, f64)>,
+    /// Energia por domínio RAPL descontada a linha de base ociosa, quando
+    /// calibrada. Sem o desconto, o consumo de repouso da máquina — que existe
+    /// com ou sem a carga — seria atribuído ao trabalho medido.
+    pub rapl_acima_j: Vec<(String, f64)>,
 }
 
 impl Medicao {
@@ -232,9 +237,20 @@ impl Medicao {
         self.gpu.as_ref().map(|g| g.acima_ociosidade_j.unwrap_or(g.total_j))
     }
 
-    /// Energia de um domínio RAPL pelo nome (`package-0`, `core`, `uncore`, `psys`).
+    /// Energia bruta de um domínio RAPL pelo nome
+    /// (`package-0`, `core`, `uncore`, `psys`).
     pub fn rapl(&self, nome: &str) -> Option<f64> {
         self.rapl_j.iter().find(|(n, _)| n == nome).map(|(_, j)| *j)
+    }
+
+    /// Energia de um domínio RAPL acima da ociosidade. Cai para a leitura
+    /// bruta se não houve calibração.
+    pub fn rapl_acima(&self, nome: &str) -> Option<f64> {
+        self.rapl_acima_j
+            .iter()
+            .find(|(n, _)| n == nome)
+            .map(|(_, j)| *j)
+            .or_else(|| self.rapl(nome))
     }
 
     pub fn relatorio(&self) -> String {
@@ -255,7 +271,13 @@ impl Medicao {
             s.push_str("  RAPL: indisponível (exige root)\n");
         } else {
             for (nome, j) in &self.rapl_j {
-                s.push_str(&format!("  RAPL {nome}: {j:.2} J\n"));
+                let acima = self
+                    .rapl_acima_j
+                    .iter()
+                    .find(|(n, _)| n == nome)
+                    .map(|(_, v)| format!(", {v:.2} J acima da ociosidade"))
+                    .unwrap_or_default();
+                s.push_str(&format!("  RAPL {nome}: {j:.2} J{acima}\n"));
             }
         }
         s
@@ -267,6 +289,8 @@ pub struct Medidor {
     intervalo_ms: u64,
     rapl: Rapl,
     ociosidade_w: Option<f64>,
+    /// Potência ociosa por domínio RAPL, em watts.
+    ociosidade_rapl_w: Vec<(String, f64)>,
     tem_nvidia: bool,
 }
 
@@ -291,6 +315,7 @@ impl Medidor {
             intervalo_ms: 50,
             rapl: Rapl::detectar(),
             ociosidade_w: None,
+            ociosidade_rapl_w: Vec::new(),
             tem_nvidia,
         }
     }
@@ -325,22 +350,41 @@ impl Medidor {
         s
     }
 
-    /// Mede a potência ociosa por alguns segundos, para descontar depois.
-    /// Chame com a máquina em repouso.
+    /// Mede a potência ociosa por alguns segundos, para descontar depois —
+    /// tanto da GPU NVIDIA quanto de cada domínio RAPL. Chame com a máquina em
+    /// repouso.
     pub fn calibrar_ociosidade(&mut self, segundos: f64) {
-        if !self.tem_nvidia {
-            return;
-        }
         let inicio = Instant::now();
-        let Some(monitor) = MonitorGpu::iniciar(self.intervalo_ms, inicio) else {
-            return;
+        let monitor = if self.tem_nvidia {
+            MonitorGpu::iniciar(self.intervalo_ms, inicio)
+        } else {
+            None
         };
+        let rapl_antes = self.rapl.instantaneo();
+
         std::thread::sleep(std::time::Duration::from_secs_f64(segundos));
-        let amostras = monitor.parar();
-        if amostras.len() >= 2 {
-            let soma: f64 = amostras.iter().map(|(_, w)| w).sum();
-            self.ociosidade_w = Some(soma / amostras.len() as f64);
+
+        let decorrido = inicio.elapsed().as_secs_f64().max(1e-9);
+        let rapl_depois = self.rapl.instantaneo();
+        self.ociosidade_rapl_w = self
+            .rapl
+            .delta(&rapl_antes, &rapl_depois)
+            .into_iter()
+            .map(|(nome, j)| (nome, j / decorrido))
+            .collect();
+
+        if let Some(monitor) = monitor {
+            let amostras = monitor.parar();
+            if amostras.len() >= 2 {
+                let soma: f64 = amostras.iter().map(|(_, w)| w).sum();
+                self.ociosidade_w = Some(soma / amostras.len() as f64);
+            }
         }
+    }
+
+    /// Potência ociosa medida por domínio RAPL.
+    pub fn ociosidade_rapl_w(&self) -> &[(String, f64)] {
+        &self.ociosidade_rapl_w
     }
 
     pub fn ociosidade_w(&self) -> Option<f64> {
@@ -376,10 +420,16 @@ impl Medidor {
             }
         });
 
-        (
-            saida,
-            Medicao { duracao_s, gpu, rapl_j: self.rapl.delta(&rapl_antes, &rapl_depois) },
-        )
+        let rapl_j = self.rapl.delta(&rapl_antes, &rapl_depois);
+        let rapl_acima_j = rapl_j
+            .iter()
+            .filter_map(|(nome, j)| {
+                let ocioso = self.ociosidade_rapl_w.iter().find(|(n, _)| n == nome)?.1;
+                Some((nome.clone(), (j - ocioso * duracao_s).max(0.0)))
+            })
+            .collect();
+
+        (saida, Medicao { duracao_s, gpu, rapl_j, rapl_acima_j })
     }
 }
 

@@ -106,7 +106,7 @@ fn treinar_gpu(medidor: &Medidor, gpu: &Gpu, lote: usize, nome: &str) -> Linha {
         m.energia_gpu_j().map(|j| j / passos as f64)
     } else {
         // A GPU integrada vive no domínio `uncore` do RAPL.
-        m.rapl("uncore").or_else(|| m.rapl("package-0")).map(|j| j / passos as f64)
+        m.rapl_acima("uncore").map(|j| j / passos as f64)
     };
 
     let s_por_passo = m.duracao_s / passos as f64;
@@ -151,7 +151,7 @@ fn treinar_cpu(medidor: &Medidor, lote: usize) -> Linha {
     let s_por_passo = m.duracao_s / passos as f64;
     let flop = flop_por_passo(lote);
     // A energia da CPU vem do RAPL; sem root, não há leitura.
-    let j_por_passo = m.rapl("package-0").map(|j| j / passos as f64);
+    let j_por_passo = m.rapl_acima("package-0").map(|j| j / passos as f64);
     Linha {
         motor: "rtensor CPU (1 núcleo)".into(),
         passos,
@@ -176,12 +176,16 @@ fn main() {
         println!("  {nome}  [{tipo}, {backend}]");
     }
 
-    print!("\ncalibrando a potência ociosa (3 s)... ");
-    medidor.calibrar_ociosidade(3.0);
+    print!("\ncalibrando a potência ociosa (5 s)... ");
+    medidor.calibrar_ociosidade(5.0);
     match medidor.ociosidade_w() {
-        Some(w) => println!("{w:.2} W"),
-        None => println!("indisponível"),
+        Some(w) => print!("NVIDIA {w:.2} W"),
+        None => print!("NVIDIA indisponível"),
     }
+    for (nome, w) in medidor.ociosidade_rapl_w() {
+        print!("  |  {nome} {w:.2} W");
+    }
+    println!();
 
     let mut linhas = Vec::new();
 
@@ -219,6 +223,11 @@ fn main() {
             l.gflops
         );
     }
+
+    println!(
+        "\nCada número é energia **acima da ociosidade**: NVIDIA pelo nvidia-smi,\n\
+         CPU pelo domínio RAPL `package-0`, Intel Arc pelo `uncore`."
+    );
 
     if !medidor.tem_rapl() {
         println!(
