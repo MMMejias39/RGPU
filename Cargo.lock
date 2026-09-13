@@ -662,6 +662,16 @@ name = "rgpu-power"
 version = "0.1.0"
 
 [[package]]
+name = "rqubit"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "rgpu-power",
+ "rtensor",
+ "wgpu",
+]
+
+[[package]]
 name = "rtensor"
 version = "0.1.0"
 dependencies = [

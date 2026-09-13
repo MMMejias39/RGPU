@@ -1,0 +1,18 @@
+[package]
+name = "rqubit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Simulador de vetor de estado quântico em GPU, independente de fabricante, com medição de energia."
+keywords = ["quantum", "simulator", "gpu", "wgpu", "state-vector"]
+categories = ["science", "simulation"]
+
+[dependencies]
+rtensor = { path = "../rtensor", features = ["gpu"] }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+rgpu-power = { path = "../rgpu-power" }

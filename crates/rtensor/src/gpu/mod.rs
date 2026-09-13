@@ -413,6 +413,21 @@ impl Gpu {
         &self.info
     }
 
+    /// Dispositivo e fila, para que outras crates construam kernels próprios
+    /// sobre o mesmo contexto — é o que `rqubit` faz.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Buffer de armazenamento cru, em elementos de 4 bytes.
+    pub fn buffer_bruto(&self, elementos: usize, rotulo: &str) -> wgpu::Buffer {
+        self.storage(elementos, rotulo)
+    }
+
     /// `true` se o adaptador oferece marcas de tempo e o perfilamento funciona.
     pub fn tem_perfilamento(&self) -> bool {
         self.perfil.is_some()

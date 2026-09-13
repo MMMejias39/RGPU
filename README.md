@@ -10,6 +10,7 @@ Metal, DX12 ou WebGPU, então o mesmo código roda em NVIDIA, AMD, Intel e Apple
 |---|---|
 | [`rtensor`](crates/rtensor) | Framework de deep learning: tensor com broadcasting, autodiff reverso, camadas, otimizadores e backend de GPU |
 | [`rgpu-power`](crates/rgpu-power) | Medição de energia: potência da GPU por `nvidia-smi`, energia da CPU e da GPU integrada por RAPL |
+| [`rqubit`](crates/rqubit) | Simulador de vetor de estado quântico, com medição de energia por porta |
 
 ## Desempenho
 
@@ -183,6 +184,33 @@ Os scripts de TensorFlow e PyTorch, com as instruções de ambiente, estão em
 [`benchmarks/python/`](benchmarks/python/).
 
 Versões medidas: burn 0.21, candle 0.11, TensorFlow 2.21.0, PyTorch 2.14.0+cu132.
+
+## Simulação quântica
+
+Simular qubits **não acelera** conta clássica — custa `2ⁿ` amplitudes complexas,
+e é sempre mais caro que a conta equivalente. O que vale é o inverso: o laço
+interno de um simulador é contração tensorial, que é o que o `rtensor` já faz.
+
+Aplicar uma porta lê duas amplitudes, multiplica por uma matriz 2×2 e escreve
+duas de volta: **0,875 flop por byte**. É o regime **oposto** ao do GEMM.
+
+| Qubits | Memória | ms/porta | GB/s | µJ/porta |
+|---:|---:|---:|---:|---:|
+| 20 | 8 MB | 0,087 | 191,9 | 698 |
+| 22 | 32 MB | 0,340 | 197,6 | 8.934 |
+| 24 | 128 MB | 1,314 | 204,2 | 67.352 |
+| 26 | 512 MB | 5,411 | 198,5 | 260.385 |
+| 27 | 1.024 MB | 10,413 | **206,2** | 515.054 |
+
+**83% dos ~256 GB/s da placa** — carga governada por banda, confirmando a
+previsão. É onde a precisão mista, medida como inútil no GEMM, deve render.
+
+O teto de **27 qubits** não é de VRAM: o WebGPU limita um binding de
+armazenamento a 2 GB, e o vetor de estado é um buffer só. 28 qubits falha na
+criação do bind group, com 4 GB de VRAM ainda livres.
+
+Nenhum simulador existente — Qiskit Aer, cuQuantum, qsim — publica joules por
+porta. Aqui isso sai de graça, porque o instrumento já existe.
 
 ## Por que energia, e não só tempo
 
