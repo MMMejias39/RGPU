@@ -29,9 +29,43 @@ no silício. Dois exemplos medidos neste repositório:
 Uma GPU subutilizada consome quase como uma GPU ocupada. Medir joules por
 unidade de trabalho é o que torna esse desperdício visível.
 
+### A medição
+
+Mesmo modelo, mesma placa, mesmo código — só muda quanto trabalho chega por
+vez. RTX 4070 Laptop, MLP 512→1024→1024→10, ociosidade de 14,1 W:
+
+| Lote | Potência média | µJ por amostra | GFLOP/J |
+|---:|---:|---:|---:|
+| 1 | 38,1 W | **12.793,5** | 0,7 |
+| 8 | 46,0 W | 2.119,2 | 4,5 |
+| 32 | 47,2 W | 599,8 | 15,8 |
+| 128 | 48,5 W | 290,7 | 32,7 |
+| 512 | 66,8 W | 196,6 | 48,3 |
+| 2048 | 69,4 W | **164,3** | 57,8 |
+
+A potência média sobe menos de **2×** entre o lote 1 e o lote 2048 — de 38 W
+para 69 W. A vazão sobe **182×**, de 1.827 para 333.412 amostras por segundo.
+O resultado é **78× de diferença na energia por amostra treinada**.
+
+O chip custa quase o mesmo ligado, fazendo muito ou pouco trabalho. Quem treina
+com lote pequeno nesta placa desperdiça cerca de 98% da energia que gasta — e
+nenhuma troca de hardware corrige isso, porque o problema não está no hardware.
+
 ```bash
-cargo run -p rtensor --release --features gpu --example energia
+cargo run -p rtensor --release --features gpu --example eficiencia   # a tabela acima
+cargo run -p rtensor --release --features gpu --example energia      # joules por motor e por fabricante
 ```
+
+### Limites desta máquina
+
+Varrer o **limite de potência** (`nvidia-smi -pl`) não é possível em GPU de
+notebook: o driver responde *"not supported in current scope"*, porque quem
+controla o envelope é o firmware do fabricante, com o Dynamic Boost ativo.
+`sudo` não contorna isso. Já **travar o clock** (`nvidia-smi -lgc`) falha por
+permissão, e portanto funciona com `sudo` — é o caminho para varrer frequência.
+
+A energia da CPU e da GPU integrada vem dos contadores RAPL, restritos a `root`
+desde a mitigação do PLATYPUS (2020).
 
 ## Estado
 

@@ -53,3 +53,7 @@ rgpu-power = { path = "../rgpu-power" }
 [[example]]
 name = "energia"
 required-features = ["gpu"]
+
+[[example]]
+name = "eficiencia"
+required-features = ["gpu"]
