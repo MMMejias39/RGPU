@@ -16,3 +16,6 @@ bytemuck = { workspace = true }
 
 [dev-dependencies]
 rgpu-power = { path = "../rgpu-power" }
+
+[[example]]
+name = "medir_externo"

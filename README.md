@@ -247,8 +247,45 @@ dois qubits é gratuita; pelo wattímetro, não é.
 É a terceira vez neste repositório que a medição de energia diz algo que a de
 tempo não diria.
 
-Nenhum simulador existente — Qiskit Aer, cuQuantum, qsim — publica joules por
-porta. Aqui isso sai de graça, porque o instrumento já existe.
+### Contra o Qiskit Aer e o cuQuantum
+
+Mesma carga — rotações `RY` com ângulos distintos, em rodízio pelos qubits.
+Milissegundos por porta, precisão simples nos três:
+
+| Qubits | rqubit `f32` | cuStateVec | Aer CPU (com fusão) |
+|---:|---:|---:|---:|
+| 22 | 0,269 | **0,133** | 1,300 |
+| 24 | 1,326 | **1,317** | 3,733 |
+| 26 | 5,412 | **5,309** | 13,364 |
+| 27 | 10,266 | **9,796** | — |
+
+**Empate técnico com o cuStateVec** — 1 a 5% de diferença em 24, 26 e 27
+qubits, e ambos a ~200 GB/s. Não é coincidência: os dois saturam a banda de
+memória, e aí não há o que otimizar além de mover os bytes. Uma biblioteca
+proprietária da NVIDIA e um kernel WGSL portátil chegam ao mesmo lugar.
+
+Em 22 qubits o cuStateVec ganha 2×: o estado é pequeno e o nosso custo por
+dispatch pesa mais.
+
+E onde nós ganhamos:
+
+| | ms/porta em 27 qubits | J/porta em 26 qubits |
+|---|---:|---:|
+| rqubit `f16` | **5,202** | **0,138** |
+| rqubit `f32` | 10,266 | 0,263 |
+| cuStateVec `f32` | 9,796 | 0,313 |
+
+O cuStateVec **não oferece meia precisão** para vetor de estado. Como a carga é
+limitada por banda, metade dos bytes é quase metade do tempo: `rqubit` em `f16`
+é **1,9× mais rápido** e **2,3× mais eficiente em energia** que o cuStateVec.
+
+Nenhum dos dois publica joules por porta. O número do cuStateVec acima foi
+medido por fora, com `rqubit/examples/medir_externo.rs` — o instrumento mede
+qualquer processo, não só o nosso.
+
+Duas armadilhas que invalidariam a comparação, e como foram tratadas, estão em
+[`benchmarks/quantum/`](benchmarks/quantum/): portas que se cancelam no
+transpilador, e a fusão de portas do Aer.
 
 ## Por que energia, e não só tempo
 
