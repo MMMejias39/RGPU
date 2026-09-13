@@ -603,7 +603,7 @@ impl Estado {
                 cache: None,
             });
 
-        let mut especializado = |fonte: &str, entrada: &str| {
+        let especializado = |fonte: &str, entrada: &str| {
             let m = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(entrada),
                 source: wgpu::ShaderSource::Wgsl(fonte.into()),
