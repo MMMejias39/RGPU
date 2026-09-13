@@ -81,3 +81,7 @@ required-features = ["gpu"]
 [[example]]
 name = "banda_compartilhada"
 required-features = ["gpu"]
+
+[[example]]
+name = "probe_coop"
+required-features = ["gpu"]

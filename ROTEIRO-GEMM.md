@@ -121,6 +121,18 @@ A aritmética por byte lido é o número que governa tudo: o laço interno faz
 **1 flop por byte** de memória compartilhada, e o canal satura em ~5 TB/s. É o
 teto de ~5 TFLOP/s que estamos encostando.
 
+## O que resta
+
+A matriz cooperativa era a última técnica da lista e a que o diagnóstico
+revisado indicava. Foi testada e **não funciona** nesta combinação de wgpu,
+naga e driver — compila e executa, mas devolve zeros. E exige `unsafe`, o que
+custaria uma das propriedades declaradas do projeto. Detalhes em
+[RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+
+Com isso o roteiro está esgotado dentro do que o WGSL oferece hoje. O GEMM ficou
+em ~4.300 GFLOP/s, ou ~4.900 com Strassen acima de 4096³, contra 3.290 no
+início — **+33% a +49%**.
+
 ## O saldo
 
 Os três itens que a literatura indicou renderam; as três micro-otimizações do

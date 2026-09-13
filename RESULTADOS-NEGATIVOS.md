@@ -39,6 +39,7 @@ negativo tem lugar neste repositório.
 | Split-K | **+12,6× a 21,4×** em formas K-dominantes | opcional |
 | Precisão mista `f16`/`f32` | **+1 a 7%** de velocidade, **−5 a 11%** de energia | mantida por outra razão |
 | Bloco `8×4` por thread | **nulo** | [revertido](experimentos/gemm-8x4/) |
+| Matriz cooperativa (tensor cores) | **não funcional** e exige `unsafe` | sonda mantida |
 
 ### Bloco 8×8 por thread — rejeitado
 
@@ -58,6 +59,34 @@ ULAs, o gargalo não é intensidade aritmética — dobrá-la só custa ocupaç�
 O kernel está preservado em [`experimentos/gemm-8x8/`](experimentos/gemm-8x8/)
 para que a tentativa não precise ser refeita, e para que quem discordar da
 conclusão possa medir por conta própria.
+
+### Matriz cooperativa — não funcional, e cobra `unsafe`
+
+Era a última técnica da lista e a que a análise apontava: uma instrução cobrindo
+um ladrilho inteiro reduziria de uma vez as leituras compartilhadas **e** as
+FMAs, que é o que o diagnóstico revisado indica ser necessário.
+
+`crates/rtensor/examples/probe_coop.rs` testou, em wgpu 30.0.1, naga 30.0.1,
+driver NVIDIA 595.91.07.
+
+**Funciona:** o adaptador anuncia `EXPERIMENTAL_COOPERATIVE_MATRIX`; o
+dispositivo aceita a feature; o WGSL compila com `enable
+wgpu_cooperative_matrix;`, os tipos `coop_mat8x8<f32, A|B|C>` e as funções
+`coopLoad`, `coopMultiplyAdd`, `coopStore`; o kernel executa e o `coopStore`
+escreve de fato — verificado com uma marca de vida em `c[63]`, que é
+sobrescrita.
+
+**Não funciona:** o resultado é zero. Testado com ponteiros para buffer de
+armazenamento e para memória de workgroup, com passo explícito. Não há
+especificação publicada da semântica de ponteiro e passo.
+
+**E há um segundo preço:** habilitar a feature exige
+`ExperimentalFeatures::enabled()`, que é **`unsafe fn`** — o wgpu declara que
+estas APIs podem conter bugs que levam a comportamento indefinido a partir de
+código seguro. Adotá-la custaria a propriedade "zero `unsafe`" do projeto.
+
+Mesmo que funcionasse, essa troca mereceria discussão. Não funcionando, a
+decisão é simples: adiar. A sonda fica como caso de reprodução.
 
 ### Bloco 8×4 — rejeitado, e contraria o diagnóstico
 
