@@ -1,2 +1,6 @@
-# Google App Engine generated folder
-appengine-generated/
+# Artefatos de build, em qualquer nível do workspace
+target/
+**/*.rs.bk
+
+# Saídas dos benchmarks
+*.csv

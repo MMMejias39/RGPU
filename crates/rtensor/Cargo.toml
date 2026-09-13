@@ -1,0 +1,48 @@
+[package]
+name = "rtensor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["deep-learning", "tensor", "autodiff", "gpu", "wgpu"]
+categories = ["science", "algorithms"]
+description = "Framework de deep learning em Rust puro: tensores com broadcasting, autodiff reverso, camadas, otimizadores e backend de GPU via wgpu — sem unsafe e sem dependências no núcleo."
+
+[dependencies]
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+
+[[example]]
+name = "bench_gpu"
+required-features = ["gpu"]
+
+[[example]]
+name = "probe_gpu"
+required-features = ["gpu"]
+
+[[example]]
+name = "bench_espiral_gpu"
+required-features = ["gpu"]
+
+[[example]]
+name = "bench_gemm"
+required-features = ["gpu"]
+
+[[example]]
+name = "suite"
+required-features = ["gpu"]
+
+[[example]]
+name = "frio"
+required-features = ["gpu"]
+
+[[example]]
+name = "perfil"
+required-features = ["gpu"]

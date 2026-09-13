@@ -1,0 +1,247 @@
+//! Confere o backend de GPU contra o motor de CPU.
+//!
+//! O caminho de CPU deriva tudo pela fita; o de GPU usa retropropagação escrita
+//! à mão em WGSL. Partindo dos mesmos pesos e dos mesmos dados, os dois têm de
+//! produzir os mesmos gradientes e a mesma trajetória de treino.
+//!
+//! Sem GPU disponível, os testes passam com um aviso em vez de falhar.
+#![cfg(feature = "gpu")]
+
+use rtensor::gpu::{upload_labels, Gpu, GpuMlp};
+use rtensor::prelude::*;
+
+const N: usize = 64;
+const D: usize = 8;
+const H: usize = 16;
+const C: usize = 4;
+
+/// Dados com rótulo aprendível: a classe é o quadrante definido pelos sinais
+/// das duas primeiras características — separável por uma MLP, mas não por um
+/// modelo linear.
+fn dados() -> (Tensor, Vec<usize>) {
+    let x: Vec<f32> = (0..N * D).map(|i| ((i as f32) * 0.37).sin()).collect();
+    let rotulos: Vec<usize> = (0..N)
+        .map(|i| {
+            let (a, b) = (x[i * D], x[i * D + 1]);
+            usize::from(a > 0.0) + 2 * usize::from(b > 0.0)
+        })
+        .collect();
+    (Tensor::new(&[N, D], x), rotulos)
+}
+
+fn modelo_cpu(rng: &mut Rng) -> Sequential {
+    Sequential::new()
+        .add(Dense::new(D, H, Activation::Relu, rng))
+        .add(Dense::new(H, H, Activation::Relu, rng))
+        .add(Dense::new(H, C, Activation::Linear, rng))
+}
+
+fn abrir() -> Option<Gpu> {
+    match Gpu::new() {
+        Ok(g) => {
+            eprintln!("GPU: {}", g.info());
+            Some(g)
+        }
+        Err(e) => {
+            eprintln!("sem GPU disponível ({e}) — teste ignorado");
+            None
+        }
+    }
+}
+
+/// Distância relativa máxima entre dois tensores.
+fn erro_rel(a: &Tensor, b: &Tensor) -> f32 {
+    assert_eq!(a.shape(), b.shape(), "shapes diferentes");
+    a.data()
+        .iter()
+        .zip(b.data())
+        .map(|(x, y)| (x - y).abs() / (1.0 + x.abs().max(y.abs())))
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn gradientes_da_gpu_batem_com_os_da_cpu() {
+    let Some(gpu) = abrir() else { return };
+    let (x, rotulos) = dados();
+    let alvos = losses::one_hot(&rotulos, C);
+
+    let mut rng = Rng::new(42);
+    let model = modelo_cpu(&mut rng);
+    let params = model.params();
+
+    // Um passo de avanço + retropropagação na CPU.
+    let tape = Tape::new();
+    let entrada = constant(&tape, x.clone());
+    let perda_cpu = losses::softmax_cross_entropy(&model.forward(&entrada), &alvos);
+    let grads_cpu = perda_cpu.backward();
+
+    // O mesmo passo na GPU, a partir dos mesmos pesos.
+    let mut mlp = GpuMlp::from_params(&gpu, &params, N, 0.0);
+    let gx = gpu.upload(&x);
+    let gy = upload_labels(&gpu, &rotulos);
+    mlp.step(&gpu, &gx, &gy);
+
+    let perda_gpu = mlp.last_loss(&gpu);
+    assert!(
+        (perda_cpu.value().item() - perda_gpu).abs() < 1e-4,
+        "perda: CPU {} vs GPU {}",
+        perda_cpu.value().item(),
+        perda_gpu
+    );
+
+    for (p, g_gpu) in params.iter().zip(mlp.grads(&gpu)) {
+        let g_cpu = grads_cpu.of(p).expect("parâmetro sem gradiente");
+        let e = erro_rel(g_cpu, &g_gpu);
+        assert!(e < 2e-4, "gradiente de {} diverge: erro relativo {e:.2e}", p.name());
+    }
+}
+
+#[test]
+fn treino_na_gpu_segue_a_mesma_trajetoria_da_cpu() {
+    let Some(gpu) = abrir() else { return };
+    let (x, rotulos) = dados();
+    let alvos = losses::one_hot(&rotulos, C);
+
+    let mut rng = Rng::new(7);
+    let model = modelo_cpu(&mut rng);
+    let params = model.params();
+
+    let mut mlp = GpuMlp::from_params(&gpu, &params, N, 0.05);
+    let gx = gpu.upload(&x);
+    let gy = upload_labels(&gpu, &rotulos);
+
+    let mut opt = Adam::new(0.05);
+    let mut perda_cpu = 0.0;
+
+    for passo in 1..=120 {
+        let tape = Tape::new();
+        let entrada = constant(&tape, x.clone());
+        let perda = losses::softmax_cross_entropy(&model.forward(&entrada), &alvos);
+        perda_cpu = perda.value().item();
+        opt.step(&params, &perda.backward());
+
+        mlp.step(&gpu, &gx, &gy);
+        let perda_gpu = mlp.last_loss(&gpu);
+
+        assert!(
+            (perda_cpu - perda_gpu).abs() < 2e-3,
+            "passo {passo}: CPU {perda_cpu:.6} vs GPU {perda_gpu:.6}"
+        );
+    }
+
+    // Depois de 120 passos os pesos ainda têm de coincidir.
+    for (p, w_gpu) in params.iter().zip(mlp.weights(&gpu)) {
+        let e = erro_rel(&p.value(), &w_gpu);
+        assert!(e < 2e-3, "peso {} divergiu: erro relativo {e:.2e}", p.name());
+    }
+
+    assert!(perda_cpu < 0.15, "o treino não convergiu: perda {perda_cpu}");
+}
+
+#[test]
+fn ida_e_volta_preserva_o_tensor() {
+    let Some(gpu) = abrir() else { return };
+    let t = Tensor::new(&[3, 5], (0..15).map(|i| i as f32 * 0.5 - 3.0).collect());
+    let volta = gpu.download(&gpu.upload(&t));
+    assert_eq!(t, volta);
+}
+
+#[test]
+fn matmul_da_gpu_bate_com_o_da_cpu() {
+    let Some(gpu) = abrir() else { return };
+    let a = Tensor::new(&[37, 23], (0..37 * 23).map(|i| (i as f32 * 0.11).sin()).collect());
+    let b = Tensor::new(&[23, 19], (0..23 * 19).map(|i| (i as f32 * 0.07).cos()).collect());
+
+    let ga = gpu.upload(&a);
+    let gb = gpu.upload(&b);
+    let gc = gpu.zeros(&[37, 19]);
+
+    let mut enc = gpu.encoder();
+    gpu.matmul(&mut enc, &ga, &gb, &gc);
+    gpu.submit(enc);
+
+    // Dimensões não múltiplas de 16 exercitam o recorte dos ladrilhos.
+    let e = erro_rel(&a.matmul(&b), &gpu.download(&gc));
+    assert!(e < 1e-5, "matmul diverge: erro relativo {e:.2e}");
+}
+
+/// Exercita as três variantes do GEMM em dimensões que não são múltiplas do
+/// ladrilho, comparando os dois kernels entre si e ambos com a CPU.
+#[test]
+fn gemm_confere_em_todas_as_variantes_e_dimensoes() {
+    let Some(mut gpu) = abrir() else { return };
+
+    // Inclui casos degenerados (1), abaixo do ladrilho (17), exatamente no
+    // ladrilho (64), logo acima (65) e sem alinhamento nenhum (130, 199).
+    let casos = [
+        (1, 1, 1),
+        (17, 33, 65),
+        (64, 64, 64),
+        (65, 64, 63),
+        (130, 96, 80),
+        (199, 130, 71),
+        (256, 512, 128),
+    ];
+
+    for (m, n, k) in casos {
+        let a = Tensor::new(&[m, k], (0..m * k).map(|i| (i as f32 * 0.013).sin()).collect());
+        let b = Tensor::new(&[k, n], (0..k * n).map(|i| (i as f32 * 0.007).cos()).collect());
+        let bt = b.t(); // [n, k], para a variante A·Bᵀ
+        let at = a.t(); // [k, m], para a variante Aᵀ·B
+
+        let esperado = a.matmul(&b);
+
+        for rapido in [false, true] {
+            gpu.set_fast_gemm(rapido);
+            let rotulo = if rapido { "ladrilhado" } else { "ingênuo" };
+
+            let ga = gpu.upload(&a);
+            let gb = gpu.upload(&b);
+            let gat = gpu.upload(&at);
+            let gbt = gpu.upload(&bt);
+
+            let c1 = gpu.zeros(&[m, n]);
+            let c2 = gpu.zeros(&[m, n]);
+            let c3 = gpu.zeros(&[m, n]);
+            let mut enc = gpu.encoder();
+            gpu.matmul(&mut enc, &ga, &gb, &c1);
+            gpu.matmul_at_b(&mut enc, &gat, &gb, &c2);
+            gpu.matmul_a_bt(&mut enc, &ga, &gbt, &c3);
+            gpu.submit(enc);
+
+            for (nome, saida) in [("mm", &c1), ("mm_atb", &c2), ("mm_abt", &c3)] {
+                let e = erro_rel(&esperado, &gpu.download(saida));
+                assert!(
+                    e < 1e-5,
+                    "{rotulo}/{nome} em {m}×{n}×{k}: erro relativo {e:.2e}"
+                );
+            }
+        }
+    }
+}
+
+/// O treino tem de dar o mesmo resultado com qualquer um dos dois kernels.
+#[test]
+fn os_dois_gemms_treinam_igual() {
+    let Some(mut gpu) = abrir() else { return };
+    let (x, rotulos) = dados();
+
+    let mut pesos_finais = Vec::new();
+    for rapido in [false, true] {
+        gpu.set_fast_gemm(rapido);
+        let mut rng = Rng::new(7);
+        let model = modelo_cpu(&mut rng);
+        let mut mlp = GpuMlp::from_params(&gpu, &model.params(), N, 0.05);
+        let gx = gpu.upload(&x);
+        let gy = upload_labels(&gpu, &rotulos);
+        for _ in 0..60 {
+            mlp.step(&gpu, &gx, &gy);
+        }
+        pesos_finais.push(mlp.weights(&gpu));
+    }
+
+    for (i, (lento, rapido)) in pesos_finais[0].iter().zip(&pesos_finais[1]).enumerate() {
+        let e = erro_rel(lento, rapido);
+        assert!(e < 1e-3, "tensor {i}: os dois GEMMs divergiram, erro {e:.2e}");
+    }
+}
