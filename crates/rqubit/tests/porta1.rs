@@ -356,3 +356,87 @@ fn fusao_colapsa_cadeias_de_um_qubit() {
         _ => panic!("esperada porta de um qubit"),
     }
 }
+
+/// A fusão em unitárias maiores tem de preservar o estado exatamente, em todos
+/// os limites de qubits.
+#[test]
+fn fusao_maior_preserva_o_estado() {
+    let Some(gpu) = abrir() else { return };
+    const N: usize = 10;
+
+    let circuito = circuito_em_camadas(N, 3);
+    let referencia = Estado::novo(&gpu, N).expect("estado");
+    let mut enc = gpu.encoder();
+    let n_direto = referencia.aplicar_circuito(&gpu, &mut enc, &circuito, false);
+    gpu.submit(enc);
+    let esperado = referencia.baixar(&gpu);
+
+    for max in 2..=4usize {
+        let estado = Estado::novo(&gpu, N).expect("estado");
+        let mut enc = gpu.encoder();
+        let n = estado.aplicar_circuito_fundido(&gpu, &mut enc, &circuito, max);
+        gpu.submit(enc);
+
+        let e = erro_max(&esperado, &estado.baixar(&gpu));
+        eprintln!(
+            "fusão até {max} qubits: {n_direto} portas → {n} ({:.2}× menos), erro {e:.2e}",
+            n_direto as f32 / n as f32
+        );
+        assert!(e < 1e-5, "fusão até {max}: erro {e:.2e}");
+    }
+}
+
+/// O kernel de N qubits tem de bater com a aplicação na CPU da mesma porta.
+#[test]
+fn kernel_de_n_qubits_bate_com_a_cpu() {
+    use rqubit::{Porta2, PortaN};
+    let Some(gpu) = abrir() else { return };
+    const N: usize = 9;
+
+    // Uma porta de 3 qubits construída compondo CNOTs que compartilham qubit.
+    let a = PortaN::de_duas(&Porta2::cnot(), 2, 5);
+    let b = PortaN::de_duas(&Porta2::cz(), 5, 7);
+    let fundida = b.compor(&a);
+    assert_eq!(fundida.alvos.len(), 3, "alvos: {:?}", fundida.alvos);
+
+    let estado = Estado::novo(&gpu, N).expect("estado");
+    let mut cpu = estado_inicial_cpu(N);
+
+    let mut enc = gpu.encoder();
+    for q in 0..N {
+        let p = Porta1::ry(0.4 + q as f32 * 0.13);
+        estado.aplicar(&gpu, &mut enc, &p, q);
+        p.aplicar_cpu(&mut cpu, q);
+    }
+    estado.aplicar_n(&gpu, &mut enc, &fundida);
+    gpu.submit(enc);
+    fundida.aplicar_cpu(&mut cpu);
+
+    let e = erro_max(&cpu, &estado.baixar(&gpu));
+    assert!(e < 1e-5, "kernel de 3 qubits diverge: {e:.2e}");
+}
+
+/// Compor portas disjuntas dá a unitária sobre a união, e aplicá-la equivale a
+/// aplicar as duas em sequência.
+#[test]
+fn composicao_de_portas_disjuntas() {
+    use rqubit::PortaN;
+    let Some(gpu) = abrir() else { return };
+    const N: usize = 8;
+
+    let a = PortaN::de_uma(&Porta1::hadamard(), 1);
+    let b = PortaN::de_uma(&Porta1::ry(0.7), 5);
+    let juntas = b.compor(&a);
+    assert_eq!(juntas.alvos.len(), 2);
+
+    let estado = Estado::novo(&gpu, N).expect("estado");
+    let mut cpu = estado_inicial_cpu(N);
+
+    let mut enc = gpu.encoder();
+    estado.aplicar_n(&gpu, &mut enc, &juntas);
+    gpu.submit(enc);
+    Porta1::hadamard().aplicar_cpu(&mut cpu, 1);
+    Porta1::ry(0.7).aplicar_cpu(&mut cpu, 5);
+
+    assert!(erro_max(&cpu, &estado.baixar(&gpu)) < 1e-6);
+}

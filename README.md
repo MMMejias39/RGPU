@@ -273,6 +273,13 @@ onde 4× a aritmética saiu de graça no relógio e custou 7% no wattímetro.
 A fusão é **reescrita algébrica exata**: o teste confere que o estado fundido é
 idêntico ao direto, com erro de 1,2·10⁻⁷.
 
+**Fundir além de dois qubits não compensa** — implementado e medido. Um kernel
+genérico de até 4 qubits reduz 308 portas a 40, e o circuito fica **22% mais
+lento** que com 112: o kernel genérico custa mais por porta do que economiza em
+passadas. A causa é o desenho dele — 64 threads em vez de 256, estagiagem em
+memória compartilhada, laços de limite variável — e não a ideia. Detalhes em
+[`RESULTADOS-NEGATIVOS.md`](RESULTADOS-NEGATIVOS.md).
+
 ### Contra o Qiskit Aer e o cuQuantum
 
 Mesma carga — rotações `RY` com ângulos distintos, em rodízio pelos qubits.

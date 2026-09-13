@@ -37,6 +37,8 @@ negativo tem lugar neste repositório.
 | Rasterização com consciência de L2 | **+5 a 6%** em 4096³ | em produção |
 | Strassen de um nível | **+11 a 13%** acima de 4096³, **−52%** em 1024³ | opcional |
 | Split-K | **+12,6× a 21,4×** em formas K-dominantes | opcional |
+| Fusão de portas até 2 qubits (`rqubit`) | **2,7× a 3,1×** em tempo e energia | padrão |
+| Fusão em unitárias de 3–4 qubits | **−9% a −22%** apesar de 3× menos portas | mantida, não padrão |
 | Precisão mista `f16`/`f32` | **+1 a 7%** de velocidade, **−5 a 11%** de energia | mantida por outra razão |
 | Bloco `8×4` por thread | **nulo** | [revertido](experimentos/gemm-8x4/) |
 | Matriz cooperativa (tensor cores) | **não funcional** e exige `unsafe` | sonda mantida |
@@ -112,6 +114,40 @@ banco rendeu 28% — nenhum dos dois isoladamente domina.
 Se isso estiver certo, o caminho restante é reduzir as **duas de uma vez**, que
 é o que a instrução de matriz cooperativa faz: um ladrilho inteiro por
 instrução. É a única técnica da lista ainda não tentada, e a placa a oferece.
+
+### Fusão em unitárias maiores — implementada, e mais lenta
+
+Kernel genérico de até 4 qubits, mais a álgebra para compor portas em conjuntos
+diferentes: expansão por produto de Kronecker via índices, e fusão greedy que
+respeita a não-comutação de portas que compartilham qubit.
+
+Reduz muito a contagem de portas. E aumenta o tempo. Circuito de 4 camadas em
+26 qubits:
+
+| Máx. qubits | Portas | ms | Ganho |
+|---:|---:|---:|---:|
+| sem fusão | 308 | 1.493 | — |
+| **2** | 112 | **545** | **2,74×** |
+| 3 | 58 | 595 | 2,51× |
+| 4 | 40 | 667 | 2,24× |
+
+Com 40 portas em vez de 112 — pouco mais de um terço — o circuito fica 22% mais
+lento.
+
+A causa é o desenho do kernel genérico, não a ideia: 64 threads por workgroup
+em vez de 256, estagiagem das amplitudes em memória compartilhada, e laços com
+limite variável que o compilador não desenrola. Um kernel especializado para 3
+qubits, com índices constantes como nos de 1 e 2, provavelmente inverteria o
+resultado — mas não foi escrito.
+
+**Mantida**, porque é correta e é o caminho se o kernel melhorar; o padrão é
+`max_qubits = 2`, e portas de 1 e 2 qubits são despachadas para os kernels
+especializados mesmo quando a fusão permite mais.
+
+Uma nota de método: a primeira medição deu números piores ainda, porque eu
+mandava até as portas de 1 e 2 qubits para o kernel genérico. Corrigir o
+despacho tirou o `max = 2` de 1,84× para 2,74× — a comparação só ficou honesta
+depois disso.
 
 ### Precisão mista — não é ganho de velocidade nem de energia
 

@@ -40,20 +40,26 @@ fn main() {
     medidor.calibrar_ociosidade(4.0);
 
     println!(
-        "{:>7} {:>8} {:>9} {:>11} {:>11} {:>9} {:>11}",
-        "qubits", "portas", "fundidas", "direto ms", "fundido ms", "ganho", "energia"
+        "{:>7} {:>8} {:>7} {:>9} {:>11} {:>9} {:>13}",
+        "qubits", "portas", "máx.", "fundidas", "ms", "ganho", "energia"
     );
 
-    for qubits in [20usize, 22, 24, 26] {
+    for qubits in [22usize, 24, 26] {
         let c = circuito(qubits, camadas);
         let estado = Estado::novo_com(&gpu, qubits, Precisao::F32).expect("estado");
 
-        let medir = |fundir: bool| -> (f64, usize, Option<f64>) {
+        // `max = 0` significa sem fusão; 2 a 4 são os limites de qubits por
+        // unitária fundida.
+        let medir = |max: usize| -> (f64, usize, Option<f64>) {
             let rodar = |repeticoes: usize| {
                 let mut enc = gpu.encoder();
                 let mut n = 0;
                 for _ in 0..repeticoes {
-                    n = estado.aplicar_circuito(&gpu, &mut enc, &c, fundir);
+                    n = if max == 0 {
+                        estado.aplicar_circuito(&gpu, &mut enc, &c, false)
+                    } else {
+                        estado.aplicar_circuito_fundido(&gpu, &mut enc, &c, max)
+                    };
                 }
                 gpu.submit(enc);
                 gpu.sync();
@@ -72,24 +78,23 @@ fn main() {
             (por_circuito, n, j)
         };
 
-        let (t_direto, n_direto, j_direto) = medir(false);
-        let (t_fundido, n_fundido, j_fundido) = medir(true);
-
-        let energia = match (j_direto, j_fundido) {
-            (Some(a), Some(b)) if b > 1e-9 => format!("{:.2}× menos", a / b),
-            _ => "—".into(),
-        };
-
+        let (t_base, n_base, j_base) = medir(0);
         println!(
-            "{:>7} {:>8} {:>9} {:>11.3} {:>11.3} {:>8.2}× {:>11}",
-            qubits,
-            n_direto,
-            n_fundido,
-            t_direto * 1e3,
-            t_fundido * 1e3,
-            t_direto / t_fundido,
-            energia
+            "{:>7} {:>8} {:>7} {:>9} {:>11.3} {:>9} {:>13}",
+            qubits, n_base, "—", n_base, t_base * 1e3, "(base)", "(base)"
         );
+        for max in 2..=4usize {
+            let (t, n, j) = medir(max);
+            let energia = match (j_base, j) {
+                (Some(a), Some(b)) if b > 1e-9 => format!("{:.2}× menos", a / b),
+                _ => "—".into(),
+            };
+            println!(
+                "{:>7} {:>8} {:>7} {:>9} {:>11.3} {:>8.2}× {:>13}",
+                "", "", max, n, t * 1e3, t_base / t, energia
+            );
+        }
+        println!();
     }
 
     println!(

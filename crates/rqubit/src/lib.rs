@@ -33,6 +33,9 @@
 //!
 //! E há espaço aberto: os simuladores existentes reportam tempo, nunca joules.
 
+pub mod porta_n;
+pub use porta_n::PortaN;
+
 use bytemuck::{Pod, Zeroable};
 use rtensor::gpu::Gpu;
 
@@ -114,11 +117,11 @@ impl Porta1 {
     }
 }
 
-fn mul(a: Complexo, b: Complexo) -> Complexo {
+pub(crate) fn mul(a: Complexo, b: Complexo) -> Complexo {
     (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
 }
 
-fn soma(a: Complexo, b: Complexo) -> Complexo {
+pub(crate) fn soma(a: Complexo, b: Complexo) -> Complexo {
     (a.0 + b.0, a.1 + b.1)
 }
 
@@ -473,6 +476,7 @@ pub struct Estado {
     buf: wgpu::Buffer,
     pipeline: wgpu::ComputePipeline,
     pipeline2: wgpu::ComputePipeline,
+    pipeline_n: wgpu::ComputePipeline,
 }
 
 impl Estado {
@@ -550,7 +554,22 @@ impl Estado {
                 cache: None,
             });
 
-        Ok(Estado { qubits, precisao, buf, pipeline, pipeline2 })
+        let modulo_n = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("porta_n"),
+            source: wgpu::ShaderSource::Wgsl(porta_n::PORTA_N.into()),
+        });
+        let pipeline_n = gpu
+            .device()
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("porta_n"),
+                layout: None,
+                module: &modulo_n,
+                entry_point: Some("porta_n"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Ok(Estado { qubits, precisao, buf, pipeline, pipeline2, pipeline_n })
     }
 
     pub fn qubits(&self) -> usize {
@@ -816,7 +835,7 @@ impl Porta2 {
 /// preserva a semântica sem precisar reordenar nada.
 pub struct Circuito {
     qubits: usize,
-    ops: Vec<Op>,
+    pub(crate) ops: Vec<Op>,
 }
 
 impl Circuito {
@@ -905,5 +924,180 @@ impl Estado {
             }
         }
         ops.len()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PortaNP {
+    grupos: u32,
+    n: u32,
+    gx: u32,
+    pad: u32,
+    alvos: [u32; 4],
+    ordenados: [u32; 4],
+}
+
+impl Estado {
+    /// Grava uma porta de `N` qubits, com `N` até 4.
+    pub fn aplicar_n(&self, gpu: &Gpu, enc: &mut wgpu::CommandEncoder, porta: &PortaN) {
+        let k = porta.alvos.len();
+        assert!((1..=4).contains(&k), "porta de {k} qubits fora da faixa 1..=4");
+        assert!(porta.alvos.iter().all(|q| *q < self.qubits));
+        assert_eq!(self.precisao, Precisao::F32, "kernel de N qubits só em f32");
+
+        let grupos = self.amplitudes() >> k;
+        let blocos = grupos.div_ceil(64);
+        let (gx, gy) = if blocos <= 32768 {
+            (blocos as u32, 1u32)
+        } else {
+            (32768, blocos.div_ceil(32768) as u32)
+        };
+
+        let mut alvos = [0u32; 4];
+        for (i, q) in porta.alvos.iter().enumerate() {
+            alvos[i] = *q as u32;
+        }
+        let mut ordenados = porta.alvos.clone();
+        ordenados.sort_unstable();
+        let mut ord = [0u32; 4];
+        for (i, q) in ordenados.iter().enumerate() {
+            ord[i] = *q as u32;
+        }
+
+        let params = PortaNP {
+            grupos: grupos as u32,
+            n: k as u32,
+            gx,
+            pad: 0,
+            alvos,
+            ordenados: ord,
+        };
+        let uniforme = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("porta_n"),
+            size: std::mem::size_of::<PortaNP>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue().write_buffer(&uniforme, 0, bytemuck::bytes_of(&params));
+
+        // A matriz vai num buffer de armazenamento: uma de 4 qubits tem 256
+        // complexos, grande demais para caber confortavelmente num uniforme.
+        let plana: Vec<f32> = porta.m.iter().flat_map(|c| [c.0, c.1]).collect();
+        let mat = gpu.buffer_bruto(plana.len(), "matriz");
+        gpu.queue().write_buffer(&mat, 0, bytemuck::cast_slice(&plana));
+
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipeline_n.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforme.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: mat.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.buf.as_entire_binding() },
+            ],
+        });
+
+        let mut passe = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("porta_n"),
+            timestamp_writes: None,
+        });
+        passe.set_pipeline(&self.pipeline_n);
+        passe.set_bind_group(0, &bind, &[]);
+        passe.dispatch_workgroups(gx, gy, 1);
+    }
+}
+
+impl Circuito {
+    /// Funde em unitárias de até `max_qubits` qubits.
+    ///
+    /// Percorre o circuito em ordem e, para cada porta, procura de trás para
+    /// frente a última pendente que **toca algum dos seus qubits**. Dali não se
+    /// pode passar: portas que compartilham qubit não comutam. Se a união
+    /// couber no limite, funde; senão, empilha nova.
+    ///
+    /// Quando nada toca os qubits da porta nova, ela comuta com tudo, e então
+    /// pode ser fundida na última pendente que couber — o que empacota portas
+    /// disjuntas numa passada só.
+    pub fn fundir_ate(&self, max_qubits: usize) -> Vec<PortaN> {
+        assert!((1..=4).contains(&max_qubits));
+        let mut pendentes: Vec<PortaN> = Vec::new();
+
+        for op in &self.ops {
+            let nova = match op {
+                Op::Uma(p, q) => PortaN::de_uma(p, *q),
+                Op::Duas(g, q0, q1) => PortaN::de_duas(g, *q0, *q1),
+            };
+
+            let mut destino = None;
+            let mut houve_intersecao = false;
+            for i in (0..pendentes.len()).rev() {
+                if pendentes[i].alvos.iter().any(|q| nova.alvos.contains(q)) {
+                    houve_intersecao = true;
+                    if uniao_cabe(&pendentes[i].alvos, &nova.alvos, max_qubits) {
+                        destino = Some(i);
+                    }
+                    break;
+                }
+            }
+            // Sem interseção, a porta comuta com todas: pode ir na última que
+            // couber, juntando trabalho disjunto numa passada só.
+            if !houve_intersecao && !pendentes.is_empty() {
+                let ultima = pendentes.len() - 1;
+                if uniao_cabe(&pendentes[ultima].alvos, &nova.alvos, max_qubits) {
+                    destino = Some(ultima);
+                }
+            }
+
+            match destino {
+                Some(i) => pendentes[i] = nova.compor(&pendentes[i]),
+                None => pendentes.push(nova),
+            }
+        }
+        pendentes
+    }
+
+    /// Aplica na CPU o circuito fundido, para conferência.
+    pub fn aplicar_cpu_fundido(&self, psi: &mut [Complexo], max_qubits: usize) {
+        for porta in self.fundir_ate(max_qubits) {
+            porta.aplicar_cpu(psi);
+        }
+    }
+}
+
+fn uniao_cabe(a: &[usize], b: &[usize], max: usize) -> bool {
+    let mut u = a.to_vec();
+    for q in b {
+        if !u.contains(q) {
+            u.push(*q);
+        }
+    }
+    u.len() <= max
+}
+
+impl Estado {
+    /// Grava um circuito fundido em unitárias de até `max_qubits`.
+    /// Devolve quantas portas foram despachadas.
+    ///
+    /// Portas de um e dois qubits vão para os kernels **especializados**, não
+    /// para o genérico: este último estagia as amplitudes em memória de
+    /// workgroup e percorre a matriz com laços de limite variável, o que custa
+    /// caro quando a especialização existe. O genérico entra só a partir de
+    /// três qubits, onde não há alternativa.
+    pub fn aplicar_circuito_fundido(
+        &self,
+        gpu: &Gpu,
+        enc: &mut wgpu::CommandEncoder,
+        circuito: &Circuito,
+        max_qubits: usize,
+    ) -> usize {
+        let portas = circuito.fundir_ate(max_qubits);
+        for p in &portas {
+            match p.alvos.len() {
+                1 => self.aplicar(gpu, enc, &p.como_uma(), p.alvos[0]),
+                2 => self.aplicar2(gpu, enc, &p.como_duas(), p.alvos[0], p.alvos[1]),
+                _ => self.aplicar_n(gpu, enc, p),
+            }
+        }
+        portas.len()
     }
 }
