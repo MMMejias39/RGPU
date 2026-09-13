@@ -111,6 +111,9 @@ cd benchmarks/rivais && cargo run --release --bin burn_bench -- 512      # burn
 cd benchmarks/rivais && cargo run --release --bin candle_bench -- 512    # candle
 ```
 
+Os scripts de TensorFlow e PyTorch, com as instruções de ambiente, estão em
+[`benchmarks/python/`](benchmarks/python/).
+
 Versões medidas: burn 0.21, candle 0.11, TensorFlow 2.21.0, PyTorch 2.14.0+cu132.
 
 ## Por que energia, e não só tempo
@@ -218,6 +221,13 @@ cargo run -p rtensor --release --features gpu --example eficiencia   # energia p
 cargo run -p rtensor --release --features gpu --example energia      # energia por motor e fabricante
 cargo run -p rtensor --release --features gpu --example perfil       # perfilamento por kernel
 ```
+
+## O que não funcionou
+
+Toda otimização tentada, incluindo as revertidas, e os erros de medição que
+custaram mais tempo que os erros de código, estão em
+[RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md). Publicar só os acertos
+falsificaria a taxa de sucesso real do trabalho.
 
 ## Licença
 
