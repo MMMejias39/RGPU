@@ -270,3 +270,89 @@ fn swap_e_a_propria_inversa() {
 
     assert!(erro_max(&cpu, &estado.baixar(&gpu)) < 1e-6);
 }
+
+/// Constrói um circuito em camadas, no formato típico de algoritmo variacional:
+/// rotações em todos os qubits, depois emaranhamento em cadeia.
+fn circuito_em_camadas(qubits: usize, camadas: usize) -> rqubit::Circuito {
+    use rqubit::{Circuito, Porta2};
+    let mut c = Circuito::novo(qubits);
+    for camada in 0..camadas {
+        for q in 0..qubits {
+            c.uma(Porta1::ry(0.19 + camada as f32 * 0.07 + q as f32 * 0.023), q);
+            c.uma(Porta1::fase(0.11 + q as f32 * 0.017), q);
+        }
+        for q in 0..qubits - 1 {
+            c.duas(Porta2::cnot(), q, q + 1);
+        }
+    }
+    c
+}
+
+/// A fusão precisa preservar o estado exatamente — é reescrita algébrica, não
+/// aproximação.
+#[test]
+fn fusao_preserva_o_estado() {
+    let Some(gpu) = abrir() else { return };
+    const N: usize = 12;
+
+    let circuito = circuito_em_camadas(N, 3);
+    let direto = Estado::novo(&gpu, N).expect("estado");
+    let fundido = Estado::novo(&gpu, N).expect("estado");
+
+    let mut enc = gpu.encoder();
+    let n_direto = direto.aplicar_circuito(&gpu, &mut enc, &circuito, false);
+    let n_fundido = fundido.aplicar_circuito(&gpu, &mut enc, &circuito, true);
+    gpu.submit(enc);
+
+    let (a, b) = (direto.baixar(&gpu), fundido.baixar(&gpu));
+    let e = erro_max(&a, &b);
+    eprintln!(
+        "{N} qubits, 3 camadas: {n_direto} portas → {n_fundido} fundidas \
+         ({:.1}× menos), erro {e:.2e}",
+        n_direto as f32 / n_fundido as f32
+    );
+
+    assert!(n_fundido < n_direto, "a fusão não reduziu nada");
+    assert!(e < 1e-5, "fusão mudou o estado: erro {e:.2e}");
+    assert!((norma(&b) - 1.0).abs() < 1e-4);
+}
+
+/// A fusão também tem de bater com a referência de CPU, não só consigo mesma.
+#[test]
+fn fusao_bate_com_a_cpu() {
+    let Some(gpu) = abrir() else { return };
+    const N: usize = 10;
+
+    let circuito = circuito_em_camadas(N, 2);
+    let estado = Estado::novo(&gpu, N).expect("estado");
+    let mut cpu = estado_inicial_cpu(N);
+
+    let mut enc = gpu.encoder();
+    estado.aplicar_circuito(&gpu, &mut enc, &circuito, true);
+    gpu.submit(enc);
+    circuito.aplicar_cpu(&mut cpu, false); // referência sem fusão
+
+    assert!(erro_max(&cpu, &estado.baixar(&gpu)) < 1e-5);
+}
+
+/// Portas de um qubit em sequência no mesmo qubit viram uma só.
+#[test]
+fn fusao_colapsa_cadeias_de_um_qubit() {
+    use rqubit::{Circuito, Op};
+    let mut c = Circuito::novo(3);
+    for _ in 0..5 {
+        c.uma(Porta1::hadamard(), 1);
+    }
+    let fundido = c.fundir();
+    assert_eq!(c.portas(), 5);
+    assert_eq!(fundido.len(), 1, "cinco portas no mesmo qubit deveriam virar uma");
+    // Hadamard cinco vezes é Hadamard: ímpar, então H⁵ = H.
+    match fundido[0] {
+        Op::Uma(p, q) => {
+            assert_eq!(q, 1);
+            let s = std::f32::consts::FRAC_1_SQRT_2;
+            assert!((p.u00.0 - s).abs() < 1e-5, "H⁵ deveria ser H, veio {:?}", p.u00);
+        }
+        _ => panic!("esperada porta de um qubit"),
+    }
+}

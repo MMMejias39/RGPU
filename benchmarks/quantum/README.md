@@ -34,6 +34,9 @@ apagado. Os scripts usam `RY` com ângulos distintos e `optimization_level=0`.
 padrão, o que dá 5,8×. É otimização legítima, mas compara o otimizador de
 circuito dele com o nosso kernel. `fusion_enable` permite medir os dois casos.
 
+O `rqubit` passou a ter fusão própria — ver `Circuito::fundir` —, então a
+comparação com `fusion_enable=on` deixou de ser assimétrica.
+
 **Precisão.** O Aer usa `complex128` por padrão, o dobro dos bytes do nosso
 `complex64`. `precision='single'` iguala.
 

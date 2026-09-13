@@ -732,3 +732,178 @@ pub fn estado_inicial_cpu(qubits: usize) -> Vec<Complexo> {
     v[0] = (1.0, 0.0);
     v
 }
+
+// ---------------------------------------------------------------------- fusão
+
+/// Uma operação de circuito, antes ou depois da fusão.
+#[derive(Clone, Copy, Debug)]
+pub enum Op {
+    /// Porta de um qubit.
+    Uma(Porta1, usize),
+    /// Porta de dois qubits, na ordem `(q0, q1)` da base `2·b₁ + b₀`.
+    Duas(Porta2, usize, usize),
+}
+
+impl Porta1 {
+    /// `self ∘ antes`: aplica `antes` e depois `self`, numa matriz só.
+    pub fn compor(&self, antes: &Porta1) -> Porta1 {
+        let a = [[self.u00, self.u01], [self.u10, self.u11]];
+        let b = [[antes.u00, antes.u01], [antes.u10, antes.u11]];
+        let mut c = [[(0.0, 0.0); 2]; 2];
+        for i in 0..2 {
+            for j in 0..2 {
+                for k in 0..2 {
+                    c[i][j] = soma(c[i][j], mul(a[i][k], b[k][j]));
+                }
+            }
+        }
+        Porta1 { u00: c[0][0], u01: c[0][1], u10: c[1][0], u11: c[1][1] }
+    }
+}
+
+impl Porta2 {
+    /// `self ∘ (porta no bit indicado)`.
+    ///
+    /// Absorve uma porta de um qubit que viria **antes** desta. Com `bit = 0` o
+    /// produto de Kronecker é `I ⊗ P`; com `bit = 1`, `P ⊗ I`. É o que permite
+    /// uma camada de portas de um qubit desaparecer dentro da de dois qubits
+    /// seguinte, sem passada extra pelo vetor de estado.
+    pub fn absorver(&self, p: &Porta1, bit: usize) -> Porta2 {
+        let pm = [[p.u00, p.u01], [p.u10, p.u11]];
+        let mut k = [[(0.0, 0.0); 4]; 4];
+        for linha in 0..4 {
+            for col in 0..4 {
+                let (la, lb) = (linha >> 1, linha & 1);
+                let (ca, cb) = (col >> 1, col & 1);
+                k[linha][col] = if bit == 0 {
+                    if la == ca { pm[lb][cb] } else { (0.0, 0.0) }
+                } else if lb == cb {
+                    pm[la][ca]
+                } else {
+                    (0.0, 0.0)
+                };
+            }
+        }
+        let mut u = [[(0.0, 0.0); 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                for t in 0..4 {
+                    u[i][j] = soma(u[i][j], mul(self.u[i][t], k[t][j]));
+                }
+            }
+        }
+        Porta2 { u }
+    }
+}
+
+/// Um circuito acumulado, com fusão de portas.
+///
+/// # Por que fundir
+///
+/// Cada porta é **uma passada completa** pelo vetor de estado, e a simulação é
+/// limitada por banda de memória. Fundir `k` portas numa só corta `k` passadas —
+/// é a otimização de maior alavanca neste regime, e não muda um byte do kernel.
+///
+/// # Como
+///
+/// Portas de um qubit no mesmo qubit se multiplicam entre si: três matrizes 2×2
+/// viram uma. E quando aparece uma porta de dois qubits, as pendentes nos seus
+/// dois qubits são **absorvidas** dentro dela, via produto de Kronecker. Uma
+/// camada de Hadamards seguida de uma camada de CNOTs custa, depois da fusão,
+/// só os CNOTs.
+///
+/// Portas em qubits disjuntos comutam, então acumular pendências por qubit
+/// preserva a semântica sem precisar reordenar nada.
+pub struct Circuito {
+    qubits: usize,
+    ops: Vec<Op>,
+}
+
+impl Circuito {
+    pub fn novo(qubits: usize) -> Circuito {
+        Circuito { qubits, ops: Vec::new() }
+    }
+
+    pub fn uma(&mut self, porta: Porta1, qubit: usize) -> &mut Self {
+        assert!(qubit < self.qubits);
+        self.ops.push(Op::Uma(porta, qubit));
+        self
+    }
+
+    pub fn duas(&mut self, porta: Porta2, q0: usize, q1: usize) -> &mut Self {
+        assert!(q0 < self.qubits && q1 < self.qubits && q0 != q1);
+        self.ops.push(Op::Duas(porta, q0, q1));
+        self
+    }
+
+    pub fn portas(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Devolve o circuito equivalente, com as portas fundidas.
+    pub fn fundir(&self) -> Vec<Op> {
+        let mut pendente: Vec<Option<Porta1>> = vec![None; self.qubits];
+        let mut saida = Vec::new();
+
+        for op in &self.ops {
+            match op {
+                Op::Uma(p, q) => {
+                    pendente[*q] = Some(match &pendente[*q] {
+                        Some(anterior) => p.compor(anterior),
+                        None => *p,
+                    });
+                }
+                Op::Duas(g, q0, q1) => {
+                    let mut fundida = *g;
+                    if let Some(p) = pendente[*q0].take() {
+                        fundida = fundida.absorver(&p, 0);
+                    }
+                    if let Some(p) = pendente[*q1].take() {
+                        fundida = fundida.absorver(&p, 1);
+                    }
+                    saida.push(Op::Duas(fundida, *q0, *q1));
+                }
+            }
+        }
+        for (q, p) in pendente.iter().enumerate() {
+            if let Some(p) = p {
+                saida.push(Op::Uma(*p, q));
+            }
+        }
+        saida
+    }
+
+    /// Aplica na CPU — referência para conferir a fusão.
+    pub fn aplicar_cpu(&self, psi: &mut [Complexo], fundido: bool) {
+        let ops = if fundido { self.fundir() } else { self.ops.clone() };
+        for op in &ops {
+            match op {
+                Op::Uma(p, q) => p.aplicar_cpu(psi, *q),
+                Op::Duas(g, q0, q1) => g.aplicar_cpu(psi, *q0, *q1),
+            }
+        }
+    }
+}
+
+impl Estado {
+    /// Grava um circuito inteiro, opcionalmente com fusão.
+    ///
+    /// Devolve quantas portas foram de fato despachadas — que é o número que
+    /// governa o tempo, porque cada uma é uma passada pelo vetor de estado.
+    pub fn aplicar_circuito(
+        &self,
+        gpu: &Gpu,
+        enc: &mut wgpu::CommandEncoder,
+        circuito: &Circuito,
+        fundir: bool,
+    ) -> usize {
+        let ops = if fundir { circuito.fundir() } else { circuito.ops.clone() };
+        for op in &ops {
+            match op {
+                Op::Uma(p, q) => self.aplicar(gpu, enc, p, *q),
+                Op::Duas(g, q0, q1) => self.aplicar2(gpu, enc, g, *q0, *q1),
+            }
+        }
+        ops.len()
+    }
+}

@@ -247,6 +247,32 @@ dois qubits é gratuita; pelo wattímetro, não é.
 É a terceira vez neste repositório que a medição de energia diz algo que a de
 tempo não diria.
 
+### Fusão de portas
+
+Cada porta é **uma passada completa** pelo vetor de estado, e a simulação é
+limitada por banda. Fundir `k` portas numa só corta `k` passadas — é a
+otimização de maior alavanca neste regime, e não muda um byte do kernel.
+
+Portas de um qubit no mesmo qubit se multiplicam entre si. E quando aparece uma
+porta de dois qubits, as pendentes nos seus dois qubits são **absorvidas**
+dentro dela por produto de Kronecker: uma camada de rotações seguida de uma
+camada de CNOTs custa, depois da fusão, só os CNOTs.
+
+Circuito em 4 camadas — rotações em todos os qubits, depois CNOTs em cadeia:
+
+| Qubits | Portas | Fundidas | Direto | Fundido | Ganho | Energia |
+|---:|---:|---:|---:|---:|---:|---:|
+| 22 | 260 | 84 | 68,1 ms | 20,8 ms | **3,28×** | 2,87× menos |
+| 24 | 284 | 92 | 375,3 ms | 122,3 ms | **3,07×** | 3,02× menos |
+| 26 | 308 | 100 | 1.567,9 ms | 510,8 ms | **3,07×** | 2,98× menos |
+
+O ganho de energia acompanha o de tempo quase exatamente — o esperado quando se
+elimina trabalho em vez de acelerá-lo. É o contraste com a porta de dois qubits,
+onde 4× a aritmética saiu de graça no relógio e custou 7% no wattímetro.
+
+A fusão é **reescrita algébrica exata**: o teste confere que o estado fundido é
+idêntico ao direto, com erro de 1,2·10⁻⁷.
+
 ### Contra o Qiskit Aer e o cuQuantum
 
 Mesma carga — rotações `RY` com ângulos distintos, em rodízio pelos qubits.
