@@ -37,7 +37,7 @@ negativo tem lugar neste repositório.
 | GEMM especializado para formas alinhadas | **nulo** | [revertido](experimentos/gemm-alinhado/) |
 | Rasterização com consciência de L2 | **+5 a 6%** em 4096³ | em produção |
 | Strassen de um nível | **+11 a 13%** acima de 4096³, **−52%** em 1024³ | opcional |
-| Split-K | **+12,6× a 21,4×** em formas K-dominantes | opcional |
+| Split-K | **+12,6× a 21,4×** em formas K-dominantes | em produção, e por forma no plano de treino |
 | Fusão de portas até 2 qubits (`rqubit`) | **2,7× a 3,1×** em tempo e energia | padrão |
 | Fusão em 3 qubits, kernel **genérico** | **−9%** apesar de 2× menos portas | substituída |
 | Fusão em 3 qubits, kernel **especializado** | **5,32×** em tempo, 4,64× em energia | em produção |

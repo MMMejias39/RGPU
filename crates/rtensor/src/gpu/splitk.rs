@@ -11,7 +11,9 @@
 ///
 /// Não é um caso raro. `∂L/∂W = Xᵀδ` tem `K` igual ao tamanho do lote, e `M`,
 /// `N` iguais às dimensões da camada: lote grande com camada estreita cai
-/// exatamente aqui.
+/// exatamente aqui. O plano de treino ([`crate::gpu::GpuMlp`]) aciona a
+/// partição por forma — no `dW` de camada estreita e no forward da camada de
+/// saída.
 ///
 /// # A partição
 ///

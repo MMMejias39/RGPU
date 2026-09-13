@@ -138,6 +138,80 @@ fn treino_na_gpu_segue_a_mesma_trajetoria_da_cpu() {
     assert!(perda_cpu < 0.15, "o treino não convergiu: perda {perda_cpu}");
 }
 
+/// O mesmo conferência da trajetória, na forma que aciona o Split-K no plano
+/// de treino: lote grande com camada de saída estreita — `dW = entradaᵀ·δ` tem
+/// `K` igual ao lote e sai com pouquíssimos blocos, exatamente o caso
+/// patológico que a partição corrige.
+#[test]
+fn treino_com_camada_estreita_usa_split_k_e_segue_a_cpu() {
+    const LOTE: usize = 512;
+    const DD: usize = 8;
+    const HH: usize = 128;
+    const CC: usize = 4;
+
+    let Some(gpu) = abrir() else { return };
+
+    // Mesma construção de dados de `dados()`, com mais amostras — o lote grande
+    // é o que liga o particionamento: no `dW` de saída (128×4, K=512) são 8
+    // fatias, e no forward da saída (512×4, K=128), 2.
+    let xs: Vec<f32> = (0..LOTE * DD).map(|i| ((i as f32) * 0.37).sin()).collect();
+    let rotulos: Vec<usize> = (0..LOTE)
+        .map(|i| {
+            let (a, b) = (xs[i * DD], xs[i * DD + 1]);
+            usize::from(a > 0.0) + 2 * usize::from(b > 0.0)
+        })
+        .collect();
+    let x = Tensor::new(&[LOTE, DD], xs);
+    let alvos = losses::one_hot(&rotulos, CC);
+
+    let mut rng = Rng::new(7);
+    let model = Sequential::new()
+        .add(Dense::new(DD, HH, Activation::Relu, &mut rng))
+        .add(Dense::new(HH, CC, Activation::Linear, &mut rng));
+    let params = model.params();
+
+    let mut mlp = GpuMlp::from_params(&gpu, &params, LOTE, 0.05);
+
+    // O plano tem de ter acionado a partição, ou este teste não testa o que
+    // diz: 4 no avanço (mm_bias + produto/redução/bias_add da saída), 11 no
+    // backward (softmax + por camada: produto/redução do dW + colsum, mais
+    // dA/relu na oculta) e 4 no Adam.
+    assert_eq!(
+        mlp.dispatches_por_passo(),
+        19,
+        "o plano não acionou o Split-K como esperado"
+    );
+
+    let gx = gpu.upload(&x);
+    let gy = upload_labels(&gpu, &rotulos);
+
+    let mut opt = Adam::new(0.05);
+    let mut perda_cpu = 0.0;
+
+    for passo in 1..=60 {
+        let tape = Tape::new();
+        let entrada = constant(&tape, x.clone());
+        let perda = losses::softmax_cross_entropy(&model.forward(&entrada), &alvos);
+        perda_cpu = perda.value().item();
+        opt.step(&params, &perda.backward());
+
+        mlp.step(&gpu, &gx, &gy);
+        let perda_gpu = mlp.last_loss(&gpu);
+
+        assert!(
+            (perda_cpu - perda_gpu).abs() < 2e-3,
+            "passo {passo}: CPU {perda_cpu:.6} vs GPU {perda_gpu:.6}"
+        );
+    }
+
+    for (p, w_gpu) in params.iter().zip(mlp.weights(&gpu)) {
+        let e = erro_rel(&p.value(), &w_gpu);
+        assert!(e < 2e-3, "peso {} divergiu: erro relativo {e:.2e}", p.name());
+    }
+
+    assert!(perda_cpu < 0.2, "o treino não convergiu: perda {perda_cpu}");
+}
+
 #[test]
 fn ida_e_volta_preserva_o_tensor() {
     let Some(gpu) = abrir() else { return };

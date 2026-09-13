@@ -151,7 +151,11 @@ redução:
 O número de fatias vem da medição: varrendo 4, 16, 64 e 128 em quatro execuções,
 **64 venceu nas quatro** (12,6× a 14,5×), com 128 oscilando entre 6,1× e 13,1×.
 `Gpu::fatias_sugeridas` mira `blocos × fatias ≈ 64`, que reproduz o ótimo medido
-nas quatro formas testadas.
+nas quatro formas testadas. No plano de treino (`GpuMlp`) a partição é acionada
+por forma: `dW = entradaᵀ·δ` com lote grande e camada estreita, e o forward da
+camada de saída, cuja largura pode ser menor que um ladrilho — medido no perfil
+do passo em lote 2048, os dois GEMMs patológicos caíram de ~0,66 ms para
+~0,18 ms de tempo de dispositivo.
 
 Cada fatia escreve num plano separado — não há escrita concorrente no mesmo
 endereço, e portanto nenhuma necessidade de atômicos, que em WGSL não existem

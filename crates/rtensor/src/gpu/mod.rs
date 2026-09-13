@@ -1301,6 +1301,16 @@ struct CamadaGpu {
     z: GpuTensor,
     a: GpuTensor,
     delta: GpuTensor,
+    /// Parciais do Split-K do `dW = entradaᵀ·δ` — `Some` só quando a forma é
+    /// K-dominante e [`Gpu::fatias_sugeridas`] manda particionar.
+    parciais_dw: Option<GpuTensor>,
+    /// Fatias do `dW`; `1` é o GEMM inteiro, sem partição.
+    fatias_dw: usize,
+    /// Parciais do Split-K do forward — só na camada de saída, que é linear
+    /// e pode ter `N` menor que um ladrilho.
+    parciais_fwd: Option<GpuTensor>,
+    /// Fatias do forward; `1` é o GEMM inteiro, sem partição.
+    fatias_fwd: usize,
 }
 
 /// MLP treinada inteiramente na GPU, com `relu` nas camadas ocultas e
@@ -1332,11 +1342,30 @@ impl GpuMlp {
         assert!(params.len() % 2 == 0, "esperado pares (W, b)");
         assert!(!params.is_empty(), "modelo sem camadas");
 
+        let ultima = params.len() / 2 - 1;
+
         let camadas: Vec<CamadaGpu> = params
             .chunks(2)
-            .map(|par| {
+            .enumerate()
+            .map(|(i, par)| {
                 let (w, b) = (par[0].value().clone(), par[1].value().clone());
                 let (entradas, unidades) = (w.shape()[0], w.shape()[1]);
+
+                // `dW = entradaᵀ·δ` tem `K` igual ao lote: lote grande com
+                // camada estreita é o caso patológico do GEMM inteiro — poucos
+                // blocos, nenhuma ocupação. O particionamento é decidido pela
+                // forma, e as parciais só existem quando há partição.
+                let fatias_dw = Gpu::fatias_sugeridas(entradas, unidades, lote);
+
+                // O forward só pode usar Split-K na camada de saída: os kernels
+                // de partição não têm epílogo de ReLU, e numa camada oculta o
+                // passe extra de ReLU comeria o ganho.
+                let fatias_fwd = if i == ultima {
+                    Gpu::fatias_sugeridas(lote, unidades, entradas)
+                } else {
+                    1
+                };
+
                 CamadaGpu {
                     mw: gpu.zeros(&[entradas, unidades]),
                     vw: gpu.zeros(&[entradas, unidades]),
@@ -1348,6 +1377,12 @@ impl GpuMlp {
                     z: gpu.zeros(&[lote, unidades]),
                     a: gpu.zeros(&[lote, unidades]),
                     delta: gpu.zeros(&[lote, unidades]),
+                    parciais_dw: (fatias_dw > 1)
+                        .then(|| gpu.zeros(&[fatias_dw * entradas, unidades])),
+                    fatias_dw,
+                    parciais_fwd: (fatias_fwd > 1)
+                        .then(|| gpu.zeros(&[fatias_fwd * lote, unidades])),
+                    fatias_fwd,
                     w: gpu.upload(&w),
                     b: gpu.upload(&b),
                 }
@@ -1359,20 +1394,34 @@ impl GpuMlp {
         let rotulos = gpu.upload_u32(&vec![0u32; lote]);
         let loss = gpu.zeros(&[lote]);
 
-        let ultima = camadas.len() - 1;
-
         // ------------------------------------------------------------ avanço
         //
-        // Um dispatch por camada: o GEMM aplica viés e ReLU no acumulador antes
-        // de escrever. As camadas ocultas guardam só a ativação em `a`; a de
-        // saída guarda os logits em `z`. Sem fusão eram três dispatches e cinco
-        // travessias de Z pela memória global por camada.
         let mut ops_fwd = Vec::new();
         for i in 0..=ultima {
             let entrada: &GpuTensor = if i == 0 { &xin } else { &camadas[i - 1].a };
             let c = &camadas[i];
             let destino = if i < ultima { &c.a } else { &c.z };
-            ops_fwd.push(gpu.op_matmul_bias(entrada, &c.w, destino, &c.b, i < ultima));
+            if c.fatias_fwd > 1 {
+                // Saída estreita: particiona `K` e aplica o viés à parte — três
+                // dispatches em vez de um, mas com paralelismo de sobra. A
+                // redução escreve os logits sem viés; o `bias_add` é in-loco.
+                ops_fwd.extend(gpu.ops_split_k(
+                    entrada,
+                    &c.w,
+                    destino,
+                    c.parciais_fwd.as_ref().unwrap(),
+                    c.fatias_fwd,
+                    false,
+                ));
+                ops_fwd.push(gpu.op_bias_add(destino, &c.b));
+            } else {
+                // Um dispatch por camada: o GEMM aplica viés e ReLU no
+                // acumulador antes de escrever. As camadas ocultas guardam só a
+                // ativação em `a`; a de saída guarda os logits em `z`. Sem
+                // fusão eram três dispatches e cinco travessias de Z pela
+                // memória global por camada.
+                ops_fwd.push(gpu.op_matmul_bias(entrada, &c.w, destino, &c.b, i < ultima));
+            }
         }
 
         // --------------------------------------------------- perda e backward
@@ -1385,7 +1434,18 @@ impl GpuMlp {
         for i in (0..=ultima).rev() {
             let entrada: &GpuTensor = if i == 0 { &xin } else { &camadas[i - 1].a };
             let c = &camadas[i];
-            ops_bwd.push(gpu.op_matmul_at_b(entrada, &c.delta, &c.dw));
+            if c.fatias_dw > 1 {
+                ops_bwd.extend(gpu.ops_split_k(
+                    entrada,
+                    &c.delta,
+                    &c.dw,
+                    c.parciais_dw.as_ref().unwrap(),
+                    c.fatias_dw,
+                    true,
+                ));
+            } else {
+                ops_bwd.push(gpu.op_matmul_at_b(entrada, &c.delta, &c.dw));
+            }
             ops_bwd.extend(gpu.ops_colsum(&c.delta, &c.db, &c.dbp));
             if i > 0 {
                 let anterior = &camadas[i - 1];
