@@ -108,6 +108,19 @@ quase ninguém mede.
 O que **não** fazer: mais micro-otimização do laço interno. Três tentativas, três
 resultados nulos ou negativos, e uma sonda que explica por quê.
 
+## O gargalo, finalmente medido
+
+`examples/banda_compartilhada.rs` isolou a resposta: **largura de banda da
+memória compartilhada**. O padrão exato do laço interno entrega 3,98 TB/s contra
+um teto de 5,10 TB/s sem conflito de banco, e rende 3.975 GFLOP/s — praticamente
+os 4.300 do GEMM completo.
+
+Remover 7/8 das multiplicações melhora só 14%, então não é aritmética.
+
+A aritmética por byte lido é o número que governa tudo: o laço interno faz
+**1 flop por byte** de memória compartilhada, e o canal satura em ~5 TB/s. É o
+teto de ~5 TFLOP/s que estamos encostando.
+
 ## O saldo
 
 Os três itens que a literatura indicou renderam; as três micro-otimizações do

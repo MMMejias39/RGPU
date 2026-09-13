@@ -77,3 +77,7 @@ required-features = ["gpu"]
 [[example]]
 name = "bench_mista"
 required-features = ["gpu"]
+
+[[example]]
+name = "banda_compartilhada"
+required-features = ["gpu"]

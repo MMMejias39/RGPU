@@ -179,11 +179,34 @@ interno não é o gargalo. A sonda de ocupação confirma por outro caminho, ao
 mostrar que aritmética pura sustenta 15–18 TFLOP/s nesta placa enquanto o GEMM
 anda a 4.
 
-**E o gargalo continua não identificado.** A hipótese seguinte — banda de
-memória — foi testada com precisão mista e também caiu: cortar os bytes pela
-metade rendeu 1 a 7%. Não é ULA, não é banda de DRAM, não é o laço interno.
-Sobram largura de banda da memória compartilhada e taxa de emissão de
-instruções, e nenhuma das duas foi medida ainda. Essa é a pergunta em aberto.
+**O gargalo foi identificado: largura de banda da memória compartilhada.**
+
+`examples/banda_compartilhada.rs` lê os mesmos bytes no mesmo padrão de
+endereços do laço interno do GEMM, variando só o que faz com eles:
+
+| Modo | ms | TB/s lidos | GFLOP/s |
+|---|---:|---:|---:|
+| `fma` — as 16 FMAs por passo, como no GEMM | 17,29 | **3,98** | **3.975** |
+| `soma` — mesmos bytes, 1/8 da aritmética | 14,79 | 4,65 | — |
+| `broadcast` — mesmos bytes, sem conflito | 13,48 | **5,10** | — |
+
+Três leituras deste resultado:
+
+1. **A sonda reproduz o GEMM.** 3.975 GFLOP/s contra os 4.300 do GEMM real. O
+   laço interno com suas leituras compartilhadas *é* o gargalo, isolado.
+2. **Não é aritmética.** Remover 7/8 das multiplicações rende 14%.
+3. **É o canal de memória compartilhada.** Estamos a 78% do teto sem conflito
+   (3,98 de 5,10 TB/s), e o conflito de banco custa os 21% restantes.
+
+O laço interno lê 32 bytes da memória compartilhada por 32 flops — **1 flop por
+byte**. Com o canal saturando em ~5 TB/s, o teto é ~5 TFLOP/s, e estamos a 4,3.
+
+Isso fecha a conta de todas as tentativas anteriores. E deixa uma contradição
+registrada: o bloco 8×8 dobraria a intensidade para 2 flops por byte, elevando o
+teto para ~10 TFLOP/s — e mediu 5% pior. A explicação provável é pressão de
+registradores no kernel completo, que a sonda sintética não reproduz. Um bloco
+intermediário, `8×4` com 32 acumuladores, aumentaria a intensidade em 1,5× com
+metade da pressão. Não foi testado.
 
 O que a literatura clássica indica em seguida está em
 [ROTEIRO-GEMM.md](ROTEIRO-GEMM.md).
