@@ -7,8 +7,9 @@
 \usepackage{amsmath,amssymb}
 \usepackage[hidelinks]{hyperref}
 
-\title{A Transformada Quântica de Fourier no teto de 28 qubits\\
-\large Metodologia, verificação numérica e comparativo com o \texttt{cuStateVec}}
+\title{Simulação quântica no teto de 27--28 qubits\\
+\large A QFT canônica e o transporte de um magnon: metodologia, verificação
+e comparativo com o \texttt{cuStateVec}}
 \author{RGPU --- simulação quântica em WGSL portátil (\texttt{rqubit})}
 \date{13 de setembro de 2026}
 
@@ -29,6 +30,12 @@ $2{,}43\times$ em tempo e $2{,}44\times$ em energia com a fusão de portas até
 faz o papel que o \texttt{cuStateVec} não oferece. Dois resultados negativos
 foram medidos e registrados: a fusão até 6 qubits \emph{perde} em 22 qubits, e
 a fusão de 2 qubits em \texttt{f16} economiza tempo e \emph{gasta} energia.
+Como segundo experimento, um caso físico completo --- o transporte de um
+magnon numa cadeia XX de 27 sítios, com solução exata fechada no setor de 1
+magnon --- mostra que o erro de Trotter ($1{,}66\cdot10^{-2}$) domina o de
+meia precisão ($1{,}45\cdot10^{-3}$) por um fator de 11: para este observável,
+o \texttt{f16} é fisicamente de graça, e a mesma trajetória de 2.600 portas
+roda $1{,}88\times$ mais rápido que no \texttt{cuStateVec}.
 \end{abstract}
 
 \section{Introdução e objetivo}
@@ -283,6 +290,101 @@ o dobro de amplitudes no mesmo tempo.
   \texttt{reps}$>0$; o resíduo de partida é da ordem de 47~J.
 \end{itemize}
 
+\section{Um caso físico: o transporte de um magnon em 27 sítios}
+
+Para medir ciência e não só pilha, o mesmo aparato simulou a cadeia XX de 27
+sítios, o sistema-padrão de transporte quântico em íons presos e qubits
+supercondutores:
+\[
+H = J \sum_{\ell} \frac{X_\ell X_{\ell+1} + Y_\ell Y_{\ell+1}}{2},
+\qquad J = 1.
+\]
+Um magnon parte do centro (sítio 13) e evolui por 100 passos de Trotter de
+primeira ordem --- 26 portas de 2 qubits por passo, 2.600 no total, $\Delta t
+= 0{,}1$, $t$ final $= 10$. A ligação é a rotação de Givens
+$e^{-iJ\delta(XX+YY)/2}$: identidade em $|00\rangle$ e $|11\rangle$, rotação
+com fase $-i$ no bloco $\{|01\rangle,|10\rangle\}$ --- preserva o número de
+magnons exatamente. No setor de 1 magnon, $H$ é a cadeia de hopping $J$ e a
+evolução \emph{exata} tem soma fechada sobre os modos normais da cadeia
+aberta:
+\[
+U(m,n,t) = \frac{2}{N+1} \sum_{k=1}^{N} \sin\tfrac{k(m+1)\pi}{N+1}\,
+\sin\tfrac{k(n+1)\pi}{N+1}\, e^{-i\,2Jt\cos\frac{k\pi}{N+1}},
+\]
+a resposta quântica exata para o estado completo de $2^{27}$ amplitudes, em
+$O(N^2)$ operações (unitariedade verificada: 0,0).
+
+\subsection{Os dois erros, separados}
+
+No mesmo circuito em 12 qubits:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrl}
+\toprule
+Erro & Fonte & Medido & Papel \\
+\midrule
+Trotter (CPU contra exato) & do circuito & $1{,}66\cdot10^{-2}$ & conhecido, quantificado \\
+Implementação (GPU \texttt{f32} contra CPU) & do kernel & $0{,}0$ & nenhum \\
+Precisão (GPU \texttt{f16} contra CPU) & do hardware & $1{,}45\cdot10^{-3}$ & 11$\times$ menor que o de Trotter \\
+\bottomrule
+\end{tabular}
+\caption{Verificação da simulação física. A GPU em \texttt{f32} reproduz o
+circuito bit a bit; o erro de \texttt{f16} é dominado pelo erro de Trotter.}
+\end{table}
+
+\subsection{A trajetória em 27 qubits}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrrrr}
+\toprule
+$t$ & eco $|\langle\psi_0|\psi(t)\rangle|^2$ & norma \texttt{f32} & norma \texttt{f16} & erro P & $\sigma(m)$ \\
+\midrule
+1,0 & 0,0504 & 1,0000 & 0,9994 & $2{,}6\cdot10^{-2}$ & 1,41 \\
+3,0 & 0,0226 & 1,0000 & 1,0002 & $1{,}8\cdot10^{-2}$ & 4,23 \\
+6,0 & 0,0023 & 1,0000 & 1,0018 & $1{,}6\cdot10^{-2}$ & 8,44 \\
+8,0 & 0,0305 & 1,0000 & 1,0010 & $2{,}3\cdot10^{-2}$ & 10,22 \\
+10,0 & 0,0273 & 1,0000 & 1,0012 & $1{,}5\cdot10^{-2}$ & 9,30 \\
+\bottomrule
+\end{tabular}
+\caption{Observáveis físicos por tempo de simulação. \texttt{erro P} é o
+desvio máximo de $P(m,t)$ contra a solução exata; $\sigma(m)$ é a largura da
+onda. O eco de Loschmidt é medido com o produto interno em GPU, sem tocar nos
+estados.}
+\end{table}
+
+A física confirmada: energia conservada ($E = 0{,}0000$ em todo $t$ --- o
+estado inicial tem $\langle H\rangle = 0$ e o Trotter preserva); espalhamento
+balístico $\sigma \approx \sqrt{2}Jt$ que \textbf{dobra em $t \approx 6{,}5$},
+quando a frente a $v = 2J$ atinge as bordas --- a reflexão da onda aparece na
+largura e no perfil final $P(m, t=10)$, com picos simétricos junto às bordas e
+conferência com a solução exata dentro do erro de Trotter. No
+\texttt{f16}, a norma vaza $1{,}8\cdot10^{-3}$ para fora do setor de 1
+magnon: física simulada pelo arredondamento, quantificada e pequena.
+
+\subsection{Comparativo com o cuStateVec}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrrr}
+\toprule
+Motor & Precisão & Tempo (2.600 portas) & ms/porta & Ganho \\
+\midrule
+\texttt{rqubit} & \texttt{f32} & 25,11 s & 9,66 & empate técnico \\
+\texttt{rqubit} & \texttt{f16} & \textbf{12,91 s} & 4,97 & $1{,}88\times$ \\
+\texttt{cuStateVec} & \texttt{f32} & 24,28 s & 9,34 & --- \\
+\bottomrule
+\end{tabular}
+\caption{Mesma trajetória física, 27 qubits. O \texttt{cuStateVec} não
+oferece meia precisão.}
+\end{table}
+
+O padrão da QFT se repete na física: empate técnico em precisão simples
+(3,4\%, dentro da margem térmica) e vitória por meia precisão onde ela existe.
+Como o erro de Trotter domina o de \texttt{f16} por 11$\times$, a economia de
+$1{,}88\times$ não custa física mensurável neste regime.
+
 \section{Conclusões}
 
 No algoritmo canônico de benchmark, no maior estado que a máquina comporta:
@@ -297,7 +399,11 @@ No algoritmo canônico de benchmark, no maior estado que a máquina comporta:
   o \texttt{cuStateVec}) e $3{,}3\times$ menos energia, ao custo de uma QFT
   aproximada cujo erro medido fica em $\sim10^{-3}$;
 \item a \textbf{energia voltou a contradizer o tempo}: a fusão de 2 qubits em
-  \texttt{f16} economiza passadas e gasta watts.
+  \texttt{f16} economiza passadas e gasta watts;
+\item na física real (transporte de magnon em 27 sítios), a cadeia de erros
+  ficou clara: o \textbf{Trotter domina a precisão por 11$\times$} --- a
+  frente de melhoria de fidelidade é o circuito, não a precisão do hardware,
+  e o \texttt{f16} entrega a mesma física em $1{,}88\times$ menos tempo.
 \end{enumerate}
 
 \appendix

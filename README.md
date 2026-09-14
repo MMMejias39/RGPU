@@ -517,6 +517,48 @@ Metodologia, testes e o comparativo completo, com as ameaças à validade,
 estão em [RELATORIO-QFT.tex](RELATORIO-QFT.tex); o resultado negativo dos
 22 qubits, em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
 
+### Um caso físico: o transporte de um magnon em 27 sítios
+
+Portas e QFTs medem a pilha; um modelo físico medido contra a sua solução
+exata mede a ciência. A cadeia XX de 27 sítios — o sistema-padrão de
+transporte quântico em íons presos e qubits supercondutores — recebe um
+magnon no centro e evolui por 100 passos de Trotter (**2.600 portas de 2
+qubits**, Δt = 0,1, t final = 10). A rotação de Givens exp(−iJδ(XX+YY)/2)
+preserva o número de magnons, e no setor de 1 magnon a evolução exata tem
+**soma fechada sobre os 27 modos normais** — a resposta quântica exata para
+o estado completo de 2²⁷ amplitudes, calculada em O(N²).
+
+A metodologia separa dois erros que costumam ser confundidos, no mesmo
+circuito em 12 qubits:
+
+| Erro | Fonte | Medido |
+|---|---|---:|
+| Trotter (CPU contra exato) | do circuito | 1,66·10⁻² |
+| Implementação (GPU f32 contra CPU) | do kernel | **0** |
+| Precisão (GPU f16 contra CPU) | do hardware | 1,45·10⁻³ |
+
+**O erro do f16 é 11× menor que o do Trotter**: para este observável, a
+meia precisão é de graça — o circuito é o gargalo, não o hardware.
+
+A trajetória completa em 27 qubits confirma a física: **energia conservada**
+(E = 0,0000 em todo t), espalhamento balístico (σ de 1,41 a 10,2 sítios) que
+dobra em t ≈ 6,5 quando a frente a v = 2J atinge as bordas — a reflexão —,
+echo de Loschmidt oscilante, e vazamento de setor de 1,8·10⁻³ no `f16`,
+quantificado. O perfil P(m, t = 10) confere com a solução exata dentro do
+erro de Trotter.
+
+Contra o cuStateVec, a mesma trajetória:
+
+| Motor | Precisão | Tempo (2.600 portas) | ms/porta |
+|---|---|---:|---:|
+| rqubit | f32 | 25,11 s | 9,66 |
+| rqubit | `f16` | **12,91 s** | 4,97 |
+| cuStateVec | f32 | 24,28 s | 9,34 |
+
+Empate técnico em f32; o `f16` — que o cuStateVec não oferece — faz a mesma
+física em **1,88×** menos tempo. Metodologia e tabelas completas em
+[RELATORIO-QFT.tex](RELATORIO-QFT.tex).
+
 ## Por que energia, e não só tempo
 
 Tempo diz quão rápido; energia diz quanto custou. Um passo duas vezes mais
@@ -645,6 +687,7 @@ Simulação quântica:
 cargo run -p rqubit --release --example bench_porta   # banda e energia por porta
 cargo run -p rqubit --release --example bench_fusao   # fusão, varrendo o limite de qubits
 cargo run -p rqubit --release --example bench_qft     # QFT completa no teto, contra o cuStateVec
+cargo run -p rqubit --release --example cadeia_magnon # transporte de um magnon, contra a solução exata
 cargo run -p rqubit --release --example medir_externo -- <comando>   # energia de outro processo
 ```
 
