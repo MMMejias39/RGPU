@@ -342,6 +342,58 @@ Mantido porque é correto e custa 32 floats, mas sem crédito de ganho.
 
 Estes custaram mais tempo que os erros de código.
 
+### A partida a fria misturava imposto de import com arquitetura
+
+O número de partida a fria do README (**0,29–0,37 s** do `rtensor` contra
+**2,41 s** do PyTorch e **5,64 s** do TensorFlow) mede o processo inteiro, e
+foi apresentado como vantagem do caminho CUDA-free. Não era só isso: o
+`rtensor` é um binário Rust nativo, e PyTorch/TensorFlow são programas Python
+que precisam primeiro importar a biblioteca — um custo de linguagem
+hospedeira, não de GPU.
+
+Decompondo com `benchmarks/python/frio_decomposto_tf.py` e
+`frio_decomposto_torch.py` em três fases — import, montagem do
+modelo/inicialização de GPU, primeiro passo —, mediana de 5 execuções cada
+(TensorFlow 2.21.0, PyTorch 2.14.0+cu130, RTX 4070 Laptop):
+
+| Motor | Import | Init. GPU/modelo | Primeiro passo | Total decomposto | Total medido por fora |
+|---|---:|---:|---:|---:|---:|
+| rtensor | — | 0,317 s | 0,0022 s | 0,319 s | 0,345 s |
+| PyTorch | 1,459 s | 1,457 s | 0,229 s | 3,145 s | 4,29 s |
+| TensorFlow | 1,871 s | 1,260 s | 1,431 s | 4,562 s | 5,59 s |
+
+**Cerca de um terço do total de TensorFlow e PyTorch é só `import`** — 1,87 s
+e 1,46 s respectivamente, sem nenhuma GPU envolvida ainda. Descontado isso, a
+comparação que sobra é mais estreita e mais honesta:
+
+- **Inicialização de dispositivo** (`wgpu`: instância, adaptador, device,
+  compilação de shaders) contra CUDA/cuDNN se preparando e o Keras montando o
+  grafo: **0,317 s contra 1,26–1,46 s — 4 a 4,6×**, e este número é
+  arquitetura de verdade.
+- **Primeiro passo**: o TensorFlow paga aqui o traçado do `tf.function`
+  (AutoGraph + grafo de gradiente), o que infla a distância para 650×. Contra
+  o PyTorch em modo eager, sem traçado, a distância cai para **104×** — o
+  número mais limpo de "despachar um passo já compilado" que este repositório
+  tem.
+- **A diferença residual** (total medido por fora menos a soma das três
+  fases: ~1,0 s no TensorFlow, ~1,15 s no PyTorch, ~26 ms no `rtensor`) é
+  overhead de processo — start do interpretador, `atexit` das threads da
+  biblioteca, flush de saída. Não foi decomposta mais fundo.
+
+A primeira execução de cada processo, com cache de driver e de disco frios,
+mede sistematicamente mais alto — no `rtensor`, 3,2 s contra ~0,33 s nas
+seguintes; no TensorFlow, a fase de montagem chegou a 3,47 s numa execução
+contra ~1,26 s nas outras quatro. As medianas acima descartam esse efeito de
+cache frio, e o texto do README já assinalava isso para o `rtensor`
+("0,29–0,37 s"); aqui ele é generalizado às três engines.
+
+**A conclusão não muda, mas o crédito é redistribuído**: o `rtensor` ainda
+vence com folga, mas ~35% da vantagem total é "binário nativo não paga import
+de Python" — um resultado real para quem escreve um script que roda e
+termina, mas que não tem relação com CUDA ser ou não contornável — e o
+restante é, sim, o `wgpu` inicializando mais rápido e despachando sem
+traçar grafo.
+
 ### A GPU de notebook muda de clock sozinha
 
 A mesma configuração mediu de **1,9 a 2,4 ms** entre execuções, e a placa variou

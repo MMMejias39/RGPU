@@ -32,6 +32,8 @@ export LD_LIBRARY_PATH=$(find venv/lib/python3.12/site-packages/nvidia \
 | `bench_grande_tf.py` | Carga pesada parametrizável: `bench_grande_tf.py N D H LOTE` |
 | `bench_torch.py` | Varredura de lote em PyTorch: `bench_torch.py [cpu\|cuda]` |
 | `frio_torch.py` | Partida a frio do PyTorch; meça o processo inteiro com `time` |
+| `frio_decomposto_tf.py` | Partida a fria do TensorFlow, separada em import / montagem do modelo e GPU / primeiro passo |
+| `frio_decomposto_torch.py` | O mesmo para PyTorch — usado para separar imposto de import de arquitetura na comparação de partida a fria |
 | `tf32_probe.py` | Liga e desliga os tensor cores TF32 para medir quanto eles valem |
 
 ## Uso

@@ -89,6 +89,37 @@ Partida a frio: processo inteiro, até o primeiro passo de treino concluído.
 De 3,4× a 17× mais rápido que os demais. Para um script que roda e termina,
 isso domina tudo o mais.
 
+*Ressalva:* essa vantagem **não é só arquitetura CUDA-free** — parte dela é
+imposto de importar Python. Decompondo em três fases (`frio_decomposto_tf.py`,
+`frio_decomposto_torch.py`, mediana de 5 execuções, TensorFlow 2.21.0, PyTorch
+2.14.0+cu130):
+
+| Motor | Import da biblioteca | Init. de GPU/modelo | Primeiro passo |
+|---|---:|---:|---:|
+| **rtensor** | — (binário nativo) | **0,317 s** | **0,0022 s** |
+| PyTorch | 1,459 s | 1,457 s | 0,229 s |
+| TensorFlow | 1,871 s | 1,260 s | 1,431 s |
+
+Cerca de **um terço** do tempo total de TensorFlow e PyTorch é só `import` —
+carregar a biblioteca Python, nada de GPU. Isso não tem nada a ver com CUDA
+ser ou não contornável; é o preço de a linguagem hospedeira ser interpretada,
+e um binário Rust não paga esse preço.
+
+A comparação que sobra depois de descontar o import ainda favorece o
+`rtensor`, mas por uma razão diferente da alegada: **inicializar o
+dispositivo** (`wgpu`: instância, adaptador, device, compilação dos shaders)
+custa 0,317 s contra 1,26–1,46 s do CUDA/cuDNN e do Keras montando o grafo —
+**4 a 4,6× mais rápido**, e este número, sim, é arquitetura. No **primeiro
+passo** a distância é maior ainda porque o TensorFlow paga o traçado do
+`tf.function` (AutoGraph + construção do grafo de gradiente) nessa mesma
+medição — 650× mais lento que o `rtensor`, mas contra o PyTorch em modo eager,
+sem traçado, a distância cai para 104×, que é o número mais limpo de
+"despachar um passo já compilado" que este repositório tem.
+
+Metodologia completa, incluindo por que a primeira execução de cada processo
+mede 2 a 4× mais alto que as seguintes (cache de driver e de disco ainda
+frios), em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+
 ### Onde o rtensor perde feio
 
 | Motor | CPU, GFLOP/s |
@@ -481,8 +512,9 @@ com a CPU a 1,1·10⁻⁸.
 
 | Qubits | rqubit direto | fusão-2 | fusão-6 (f32) | cuStateVec | Melhor |
 |---:|---:|---:|---:|---:|---|
-| 22 | 67,6 ms | 55,8 | 90,7 | **37,7** | cuStateVec 1,8× |
-| 24 | 392,2 | 362,1 | **199,8** | 367,2 | rqubit 1,84× |
+| 22 | 56,7 ms | 55,1 | 90,7 | **37,7** | cuStateVec 1,6× |
+| 23 | 185,5 | 171,2 | **126,5** | — | rqubit 1,47× |
+| 24 | 392,8 | 362,3 | **196,4** | 367,2 | rqubit 2,00× |
 | 26 | 1.758,7 | 1.636,1 | **756,2** | 1.716,2 | rqubit 2,27× |
 | 26, `f16` | 925,2 | 822,4 | — | 1.716,2 | rqubit 2,09× |
 | 27 | 3.745,2 | 3.480,5 | **1.539,7** | 3.685,0 | rqubit 2,39× |
@@ -491,12 +523,16 @@ com a CPU a 1,1·10⁻⁸.
 Três leituras. Em precisão simples, **kernel a kernel é empate técnico** —
 3.745 contra 3.685 ms em 27 qubits, com os dois saturando a mesma banda
 (~224–228 GB/s medidos). A **fusão até 6 qubits** corta 391 portas a 82 e
-dá **2,43× em tempo e 2,44× em energia** (102,0 J contra 249,0 J) — mas
-**perde em 22 qubits**: o estado de 32 MiB cabe na L2, as passadas ficam
-baratas e o custo por dispatch dos kernels especializados não se paga; o
-cruzamento fica entre 22 e 24 qubits. E a **meia precisão compra um qubit
-inteiro**: 4,03 s em 28 qubits `f16` contra 7,92 s do cuStateVec, que não
-oferece `f16` — a mesma ressalva já registrada para as portas isoladas.
+dá **2,43× em tempo e 2,44× em energia** (102,0 J contra 249,0 J) — e o
+cruzamento foi varrido: em 22 qubits ela perde (90,7 contra 56,7 ms, −37%,
+medidos lado a lado), porque o estado de 32 MiB cabe na L2 e as passadas
+ficam baratas; **em 23 qubits o estado de 64 MiB já sai da L2 e a fusão
+vence (126,5 contra 185,5 ms, 1,47×)**, chegando a 2,00× em 24 e 2,43× em
+27. Na energia, a fusão-6 vence em todos os tamanhos medidos — mesmo onde
+perde tempo, em 22, ela gasta menos (2,12 J contra 2,93 J). E a **meia
+precisão compra um qubit inteiro**: 4,03 s em 28 qubits `f16` contra 7,92 s
+do cuStateVec, que não oferece `f16` — a mesma ressalva já registrada para
+as portas isoladas.
 
 Energia por circuito, com o método de cada número anotado:
 
