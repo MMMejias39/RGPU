@@ -468,6 +468,55 @@ Duas armadilhas que invalidariam a comparação, e como foram tratadas, estão e
 [`benchmarks/quantum/`](benchmarks/quantum/): portas que se cancelam no
 transpilador, e a fusão de portas do Aer.
 
+### A QFT completa: um algoritmo real no teto
+
+Portas isoladas medem o kernel; um algoritmo mede a pilha. A Transformada
+Quântica de Fourier inteira — H em cada qubit, fases controladas entre todos
+os pares, reversão final — tem **O(n²) portas: 420 em 28 qubits**, cada uma
+uma passada por 1 GiB de estado. É o circuito canônico de benchmark, e é
+onde o produto interno novo prova a física: ⟨ψ|ψ⟩ = 1 depois da QFT, e a
+ida-e-volta QFT⁻¹∘QFT devolve sobreposição 1 — 0,999998 em f32; 0,9985 em
+f16, o arredondamento acumulado de ~400 portas. Em 8 qubits, a GPU confere
+com a CPU a 1,1·10⁻⁸.
+
+| Qubits | rqubit direto | fusão-2 | fusão-6 (f32) | cuStateVec | Melhor |
+|---:|---:|---:|---:|---:|---|
+| 22 | 67,6 ms | 55,8 | 90,7 | **37,7** | cuStateVec 1,8× |
+| 24 | 392,2 | 362,1 | **199,8** | 367,2 | rqubit 1,84× |
+| 26 | 1.758,7 | 1.636,1 | **756,2** | 1.716,2 | rqubit 2,27× |
+| 26, `f16` | 925,2 | 822,4 | — | 1.716,2 | rqubit 2,09× |
+| 27 | 3.745,2 | 3.480,5 | **1.539,7** | 3.685,0 | rqubit 2,39× |
+| 28, `f16` | 4.031,6 | **3.763,9** | — | 7.916,4 | rqubit 1,96× |
+
+Três leituras. Em precisão simples, **kernel a kernel é empate técnico** —
+3.745 contra 3.685 ms em 27 qubits, com os dois saturando a mesma banda
+(~224–228 GB/s medidos). A **fusão até 6 qubits** corta 391 portas a 82 e
+dá **2,43× em tempo e 2,44× em energia** (102,0 J contra 249,0 J) — mas
+**perde em 22 qubits**: o estado de 32 MiB cabe na L2, as passadas ficam
+baratas e o custo por dispatch dos kernels especializados não se paga; o
+cruzamento fica entre 22 e 24 qubits. E a **meia precisão compra um qubit
+inteiro**: 4,03 s em 28 qubits `f16` contra 7,92 s do cuStateVec, que não
+oferece `f16` — a mesma ressalva já registrada para as portas isoladas.
+
+Energia por circuito, com o método de cada número anotado:
+
+| Qubits | rqubit direto | rqubit fusão-6 | cuStateVec (por fora) |
+|---:|---:|---:|---:|
+| 26, f32 | 120,9 J | **47,8 J** | ~65,5 J |
+| 26, `f16` | **36,6 J** | — | ~65,5 J |
+| 27, f32 | 249,0 J | **102,0 J** | — |
+| 28, `f16` | **246,4 J** | — | ~288,3 J |
+
+O `f16` faz **3,3× menos energia** que o f32 no mesmo circuito — mais que os
+2× dos bytes, porque a potência média também cai. E a fusão de 2 qubits em
+`f16` **custa energia**: 822 ms contra 925, mas 48,9 J contra 36,6 J — a
+Hadamard absorvida faz aritmética extra por byte, e num regime limitado por
+banda isso não compra tempo, cobra watt.
+
+Metodologia, testes e o comparativo completo, com as ameaças à validade,
+estão em [RELATORIO-QFT.tex](RELATORIO-QFT.tex); o resultado negativo dos
+22 qubits, em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+
 ## Por que energia, e não só tempo
 
 Tempo diz quão rápido; energia diz quanto custou. Um passo duas vezes mais
@@ -595,6 +644,7 @@ Simulação quântica:
 ```bash
 cargo run -p rqubit --release --example bench_porta   # banda e energia por porta
 cargo run -p rqubit --release --example bench_fusao   # fusão, varrendo o limite de qubits
+cargo run -p rqubit --release --example bench_qft     # QFT completa no teto, contra o cuStateVec
 cargo run -p rqubit --release --example medir_externo -- <comando>   # energia de outro processo
 ```
 

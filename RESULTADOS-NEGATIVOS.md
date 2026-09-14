@@ -45,7 +45,30 @@ negativo tem lugar neste repositório.
 | Fusão em 4 qubits, kernel **especializado** | **7,65×** em tempo, 5,64× em energia | em produção |
 | Precisão mista `f16`/`f32` | **+1 a 7%** de velocidade, **−5 a 11%** de energia | mantida por outra razão |
 | Bloco `8×4` por thread | **nulo** | [revertido](experimentos/gemm-8x4/) |
+| Fusão até 6 qubits em 22 qubits (QFT) | **−34%** (90,7 ms contra 67,6) | cruzamento medido entre 22 e 24 |
+| Fusão de 2 qubits em `f16` (QFT) | **+11% de tempo**, mas **+34% de energia** | ganho de tempo sem ganho de energia |
 | Matriz cooperativa (tensor cores) | o "não funcional" era diagnóstico errado: **funciona** nas configurações anunciadas; exige `unsafe` e operandos `f16` | sondas mantidas |
+
+### A QFT em 22 qubits: a fusão até 6 perde, e a de 2 custa watt
+
+A Transformada Quântica de Fourier completa (`examples/bench_qft.rs`) foi
+medida de 22 a 28 qubits contra o `cuStateVec`. Dois resultados negativos
+no menor tamanho:
+
+**Fusão até 6 qubits em 22 qubits — −34%.** Os kernels especializados de 3
+a 6 qubits cortam as 264 portas da QFT a 56, e mesmo assim levam 90,7 ms
+contra 67,6 do caminho direto — 1,62 ms por porta original contra 0,26. A
+causa é o regime: com 32 MiB, o estado inteiro cabe na L2 da placa, cada
+passada custa pouco, e o ganho de cortar passadas não paga o custo maior
+por dispatch. Em 24 qubits o mesmo desenho já vence (199,8 contra 392,2 ms)
+e em 27 dá 2,43×. Onde está a fronteira exata não foi varrido.
+
+**Fusão de 2 qubits em `f16` — tempo melhor, energia pior.** Em 26 qubits,
+a fusão absorve as Hadamards nos CPs e corta o circuito de 364 a 338
+portas: 822 ms contra 925. Mas gasta 48,9 J contra 36,6 J — **+34% de
+energia para −11% de tempo**. A porta fundida faz mais aritmética por byte,
+e numa carga limitada por banda isso é de graça no relógio e caro no
+wattímetro — a quarta vez neste repositório que as duas medições divergem.
 
 ### Bloco 8×8 por thread — rejeitado
 

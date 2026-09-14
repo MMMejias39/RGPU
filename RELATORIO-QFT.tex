@@ -1,0 +1,326 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazil]{babel}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage[hidelinks]{hyperref}
+
+\title{A Transformada Quântica de Fourier no teto de 28 qubits\\
+\large Metodologia, verificação numérica e comparativo com o \texttt{cuStateVec}}
+\author{RGPU --- simulação quântica em WGSL portátil (\texttt{rqubit})}
+\date{13 de setembro de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Este relatório documenta a execução da Transformada Quântica de Fourier (QFT)
+completa --- o circuito canônico de benchmark, com $O(n^2)$ portas --- no maior
+estado que o binding do WebGPU permite: 27 qubits em precisão simples e
+\textbf{28 qubits em meia precisão}, 420 portas, cada uma uma passada completa
+por 1~GiB de estado. A carga foi medida no \texttt{rqubit} (kernels WGSL sobre
+Vulkan, sem CUDA) e no \texttt{cuStateVec}, a biblioteca de vetor de estado da
+própria NVIDIA, na mesma máquina. Resultados principais: empate técnico com o
+\texttt{cuStateVec} em precisão simples (ambos a $\sim$224--228~GB/s), ganho de
+$2{,}43\times$ em tempo e $2{,}44\times$ em energia com a fusão de portas até
+6 qubits, e $1{,}96\times$ em tempo no teto de 28 qubits, onde a meia precisão
+faz o papel que o \texttt{cuStateVec} não oferece. Dois resultados negativos
+foram medidos e registrados: a fusão até 6 qubits \emph{perde} em 22 qubits, e
+a fusão de 2 qubits em \texttt{f16} economiza tempo e \emph{gasta} energia.
+\end{abstract}
+
+\section{Introdução e objetivo}
+
+Portas isoladas medem o kernel; um algoritmo mede a pilha. O objetivo deste
+experimento é submeter o \texttt{rqubit} --- simulador de vetor de estado
+quântico em Rust puro, sobre \texttt{wgpu}/WGSL --- a uma carga com a estrutura
+de um algoritmo de verdade e compará-lo, na mesma máquina e na mesma carga, ao
+\texttt{cuStateVec} da NVIDIA. A QFT foi escolhida por três razões:
+
+\begin{itemize}
+\item é o circuito de benchmark canônico, usado em demonstrações do Qiskit e do
+  cuQuantum, o que torna o comparativo reconhecível;
+\item tem fator de ramificação alto: fases controladas entre \emph{todos} os
+  pares de qubits, o que estressa tanto o kernel de 2 qubits quanto a fusão;
+  \item escala com $O(n^2)$ portas, o que permite chegar ao teto de qubits da
+  máquina sem explosão de tempo.
+\end{itemize}
+
+O experimento também serve de primeiro uso real do produto interno em GPU
+($\langle a|b\rangle$), implementado em dois estágios sobre o mesmo vetor de
+estado: é ele que prova, depois da QFT completa, que a norma do estado sobreviveu
+a 420 portas.
+
+\section{Metodologia}
+
+\subsection{O circuito}
+
+A QFT segue a forma padrão com o qubit $q$ de peso $2^q$:
+\begin{enumerate}
+\item para cada $j \in \{0,\dots,n-1\}$: Hadamard em $q_j$, seguida de portas
+  controladas-fase $\mathrm{CP}(2\pi/2^{k-j})$ entre todo par $(q_k, q_j)$ com
+  $k > j$;
+\item reversão final da ordem dos qubits por SWAPs.
+\end{enumerate}
+O total é $n + n(n-1)/2 + n/2$ portas --- 264 em 22 qubits, 364 em 26, 391 em
+27 e \textbf{420 em 28}. A inversa exata, usada na verificação de ida-e-volta,
+inverte a ordem das portas e troca o sinal dos ângulos.
+
+A porta controlada-fase $\mathrm{CP}(\theta) = \operatorname{diag}(1,1,1,e^{i\theta})$
+não existe pronta na API; foi construída diretamente sobre o campo público de
+matriz de \texttt{Porta2}, com a fase no elemento $[3][3]$ --- a convenção de
+índices ($|11\rangle$ por último) foi verificada no kernel e em
+\texttt{aplicar\_cpu}.
+
+\subsection{A pilha e as precisões}
+
+O \texttt{rqubit} guarda o vetor de estado residente na GPU como um único
+buffer. O teto de qubits é imposto pelo limite de binding do WebGPU (2~GB
+menos 4 bytes):
+\begin{itemize}
+\item \texttt{f32} (\texttt{complex64}): 8~B por amplitude $\Rightarrow$
+  \textbf{27 qubits} (1~GiB);
+\item \texttt{f16} empacotado: 4~B por amplitude $\Rightarrow$ \textbf{28 qubits}
+  (1~GiB) --- 29 qubits exigiriam exatamente 2~GiB, acima do limite.
+\end{itemize}
+
+Cada porta é uma passada completa pelo vetor de estado; numa carga limitada por
+banda de memória, o tempo por porta é governado pelos bytes movidos
+(leitura + escrita). A fusão de portas reduz o número de passadas: a fusão de
+2 qubits absorve portas de 1 qubit pendentes na porta de 2 seguinte; a fusão
+até 6 qubits usa os kernels especializados (amplitudes em registradores,
+índices literais), que só existem em \texttt{f32}.
+
+\subsection{Protocolo de medição}
+
+\begin{itemize}
+\item \textbf{Tempo:} uma execução de aquecimento, depois três execuções
+  cronometradas; o valor reportado é a média por circuito. Cada execução
+  aplica a QFT inteira sobre o estado corrente --- o custo das portas não
+  depende do estado.
+\item \textbf{Energia do \texttt{rqubit}:} janela calibrada de pelo menos
+  $\sim$4~s (repetições ajustadas por circuito, mínimo de 3), medida pelo
+  \texttt{rgpu-power} via \texttt{nvidia-smi}, com ociosidade calibrada antes
+  de cada rodada.
+\item \textbf{Energia do \texttt{cuStateVec}:} medida por fora do processo
+  (\texttt{medir\_externo}), pela diferença entre uma execução só de partida
+  (\texttt{reps=0}) e a execução com $R$ repetições, dividida pelo número de
+  circuitos de fato executados (aquecimento incluso). Os dois instrumentos não
+  são idênticos; os números de energia são comparáveis com ressalva.
+\item \textbf{Comparativo:} \texttt{cuStateVec} via \texttt{cuquantum-python}
+  (precisão simples, \texttt{complex64}), matrizes pré-carregadas no
+  dispositivo, venv dedicado fora do repositório. O Aer (CPU) não entrou nesta
+  rodada; a GPU dele não foi instalada (incompatível com o Qiskit 2.5) e a
+  comparação GPU$\times$CPU já está coberta no README para portas isoladas.
+\end{itemize}
+
+\section{Testes de verificação}
+
+A medição só vale se a física estiver de pé. Três verificações acompanham a
+execução, todas com o produto interno em GPU como instrumento:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrl}
+\toprule
+Teste & O que prova & Medido & Tolerância \\
+\midrule
+8 qubits: QFT GPU contra CPU & correção do circuito & erro máx.\ $1{,}12\cdot10^{-8}$ & $10^{-4}$ \\
+8 qubits: $|{\rm amplitude}|$ & estrutura da QFT de $|x_0\rangle$ & $0{,}0625$ exato & $1/\sqrt{N}$ \\
+27 qubits \texttt{f32}: $\langle\psi|\psi\rangle$ após QFT & normalização & $0{,}999997$ & $10^{-4}$ \\
+27 qubits \texttt{f32}: $\langle x_0|\mathrm{QFT}^{-1}\mathrm{QFT}|x_0\rangle$ & cadeia de 782 portas & $0{,}999998$ & $10^{-4}$ \\
+28 qubits \texttt{f16}: $\langle\psi|\psi\rangle$ após QFT & normalização em \texttt{f16} & $0{,}997077$ & $10^{-2}$ \\
+28 qubits \texttt{f16}: ida-e-volta (785 portas fundidas) & física em \texttt{f16} & $0{,}998535$ & $10^{-2}$ \\
+\bottomrule
+\end{tabular}
+\caption{Verificações numéricas. O estado inicial $|x_0\rangle$ é preparado com
+portas X (padrão de bits alternados; em 8 qubits, $x_0 = 0\mathrm{b}10110001$).}
+\end{table}
+
+O desvio do \texttt{f16} ($\approx -2{,}9\cdot10^{-3}$ na norma) é o erro de
+arredondamento acumulado de centenas de portas cujos ângulos não são
+representáveis em meia precisão --- mesma ordem de grandeza medida em testes
+unitários de rotações. Um efeito estrutural vem de graça: ângulos CP abaixo da
+resolução de \texttt{f16} ($\sim5\cdot10^{-4}$) agem como identidade, de modo
+que a QFT em \texttt{f16} é \emph{aproximada por construção} --- a QFT
+aproximada da literatura, sem custo extra de implementação.
+
+\section{Resultados de tempo}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrrrr}
+\toprule
+Qubits & Prec. & Portas & Fundidas & ms/circuito & ms/porta & Banda (GB/s) \\
+\midrule
+22 & f32 & 264 & 264 (direto) & 67,6 & 0,256 & --- \\
+22 & f32 & 264 & 242 (fusão-2) & 55,8 & 0,230 & --- \\
+22 & f32 & 264 & 56 (fusão-6) & 90,7 & 1,620 & --- \\
+24 & f32 & 312 & 312 (direto) & 392,2 & 1,257 & --- \\
+24 & f32 & 312 & 60 (fusão-6) & \textbf{199,8} & 3,329 & --- \\
+26 & f32 & 364 & 364 (direto) & 1.758,7 & 4,832 & 212 \\
+26 & f32 & 364 & 68 (fusão-6) & \textbf{756,2} & 11,121 & 494 \\
+26 & f16 & 364 & 364 (direto) & \textbf{925,2} & 2,542 & 403 \\
+26 & f16 & 364 & 338 (fusão-2) & 822,4 & 2,433 & 455 \\
+27 & f32 & 391 & 391 (direto) & 3.745,2 & 9,579 & 224 \\
+27 & f32 & 391 & 82 (fusão-6) & \textbf{1.539,7} & 18,777 & 524 \\
+28 & f16 & 420 & 420 (direto) & 4.031,6 & 9,599 & 224 \\
+28 & f16 & 420 & 392 (fusão-2) & 3.763,9 & 9,602 & 240 \\
+\bottomrule
+\end{tabular}
+\caption{QFT completa no \texttt{rqubit}. A ``banda'' é o tráfego efetivo
+($2\times$ o estado por porta, $2\times$ as portas fundidas por circuito),
+não um teto de hardware. Em \texttt{f16}, \texttt{28} qubits não têm
+contraparte \texttt{f32} (o binding não permite), e a fusão-6 não existe
+(os kernels de $N$ qubits são só em \texttt{f32}).}
+\end{table}
+
+O caso direto é governado por banda: em 27 e 28 qubits o tráfego efetivo fica
+em $\sim$224~GB/s de $\sim$256 disponíveis. O previsto pela banda
+(420 portas $\times$ 2~GiB $\div$ 200~GB/s $\approx 4{,}2$~s) deu
+4,03~s medidos --- dentro de 5\%.
+
+\section{Resultados de energia}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrr}
+\toprule
+Qubits & Prec. & rqubit direto & rqubit fusão-6 & cuStateVec (por fora) \\
+\midrule
+26 & f32 & 120,9 J & \textbf{47,8 J} & $\sim$65,5 J \\
+26 & f16 & \textbf{36,6 J} & --- & $\sim$65,5 J \\
+27 & f32 & 249,0 J & \textbf{102,0 J} & --- \\
+28 & f16 & \textbf{246,4 J} & --- & $\sim$288,3 J \\
+\bottomrule
+\end{tabular}
+\caption{Energia por circuito. A coluna do \texttt{cuStateVec} vem de
+medição externa (diferença entre execução de partida e execução com carga,
+dividida pelos circuitos executados); a do \texttt{rqubit}, do medidor
+integrado. Métodos distintos: comparar com ressalva.}
+\end{table}
+
+Dois destaques. A meia precisão faz \textbf{3,3$\times$ menos energia} que a
+simples no mesmo circuito (36,6 contra 120,9 J em 26 qubits) --- mais que os
+$2\times$ dos bytes, porque a potência média também cai. E a fusão de 2 qubits
+em \texttt{f16} \emph{custa} energia: 822~ms contra 925 (ganho de 11\%), mas
+48,9~J contra 36,6~J (+34\%). A Hadamard absorvida no CP faz aritmética extra
+por byte; num regime limitado por banda isso não compra tempo --- cobra watt.
+É a quarta vez neste repositório em que a medição de energia contradiz a de
+tempo.
+
+\section{Comparativo com o cuStateVec}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrrr}
+\toprule
+Qubits & rqubit direto & rqubit fusão-2 & rqubit fusão-6 & cuStateVec & Melhor \\
+\midrule
+22 & 67,6 & 55,8 & 90,7 & \textbf{37,7} & cuStateVec $1{,}8\times$ \\
+24 & 392,2 & 362,1 & \textbf{199,8} & 367,2 & rqubit $1{,}84\times$ \\
+26 & 1.758,7 & 1.636,1 & \textbf{756,2} & 1.716,2 & rqubit $2{,}27\times$ \\
+26 (f16) & 925,2 & 822,4 & --- & 1.716,2 & rqubit $2{,}09\times$ \\
+27 & 3.745,2 & 3.480,5 & \textbf{1.539,7} & 3.685,0 & rqubit $2{,}39\times$ \\
+28 (f16) & 4.031,6 & \textbf{3.763,9} & --- & 7.916,4 & rqubit $1{,}96\times$ \\
+\bottomrule
+\end{tabular}
+\caption{ms por circuito (QFT completa). \texttt{cuStateVec} em precisão
+simples; não oferece meia precisão para vetor de estado.}
+\end{table}
+
+\textbf{Leitura 1 --- empate técnico em precisão simples.} Sem fusão, o
+\texttt{rqubit} mede 3.745~ms contra 3.685 do \texttt{cuStateVec} em 27
+qubits ($1{,}6\%$), e 1.759 contra 1.716 em 26. Os dois saturam a banda de
+DRAM ($\sim$224--228~GB/s calculados); quando o gargalo é mover bytes, um
+kernel WGSL portátil e a biblioteca proprietária da NVIDIA chegam ao mesmo
+lugar. É o mesmo resultado do README para portas isoladas, agora num
+algoritmo completo.
+
+\textbf{Leitura 2 --- a fusão é o diferencial.} Os CPs consecutivos sobre o
+mesmo qubit alvo fundem-se em unitárias de até 6 qubits: 391 portas viram 82,
+e o circuito cai $2{,}43\times$ em tempo e $2{,}44\times$ em energia. A
+comparação é justa na direção do que cada API entrega: o \texttt{cuStateVec}
+é de baixo nível e não funde portas; a fusão do \texttt{rqubit} é parte da
+pilha medida. A NVIDIA tem camadas superiores (\texttt{cutensornet}) que
+fariam otimização equivalente --- a ressalva já registrada no README vale
+aqui.
+
+\textbf{Leitura 3 --- o regime pequeno pertence ao cuStateVec.} Em 22 qubits o
+estado (32~MiB) cabe na L2 da placa: as passadas ficam baratas, o custo fixo
+por dispatch domina, e o \texttt{cuStateVec} --- com despacho mais leve
+(0,143~ms/porta contra 0,256) --- vence $1{,}8\times$. Nesse regime, cortar
+passadas não rende: a fusão até 6 qubits é 34\% \emph{mais lenta} que o
+caminho direto. O cruzamento fica entre 22 e 24 qubits e não foi varrido.
+
+\textbf{Leitura 4 --- meia precisão compra um qubit inteiro.} No teto, o
+\texttt{rqubit} em \texttt{f16} faz a QFT de 28 qubits em 4,03~s contra 7,92~s
+do \texttt{cuStateVec} em \texttt{f32} ($1{,}96\times$) e $\sim$288~J contra
+246~J. A conta é de banda: ambos movem bytes a $\sim$224--228~GB/s; o
+\texttt{f16} move metade dos bytes por porta e, portanto, cabe um estado com
+o dobro de amplitudes no mesmo tempo.
+
+\section{Ameaças à validade}
+
+\begin{itemize}
+\item \textbf{Deriva térmica:} GPU de notebook muda de clock sozinha; efeitos
+  abaixo de $\sim$20\% não são resolvíveis por cronometragem de parede nesta
+  máquina (registro em \texttt{RESULTADOS-NEGATIVOS.md}). As linhas do
+  comparativo foram medidas em sessões separadas; o empate de 27 qubits
+  ($1{,}6\%$) está dentro dessa margem e deve ser lido como empate, não como
+  vitória do \texttt{cuStateVec}.
+\item \textbf{Métodos de energia distintos:} medidor integrado
+  (\texttt{rqubit}) contra medição externa do processo (\texttt{cuStateVec}),
+  com janelas e composições de ociosidade diferentes. As diferenças de energia
+  abaixo de $\sim$30\% não são conclusivas; as de $2\times$ ou mais, sim.
+\item \textbf{Repetição sobre estado corrente:} as repetições aplicam a QFT
+  sobre o estado já transformado. O custo das portas não depende do estado,
+  mas o padrão de bits pode afetar consumo de forma residual.
+\item \textbf{Água no aquecimento do cuStateVec:} a partida do Python e a
+  inicialização do CUDA foram isoladas pela diferença entre \texttt{reps=0} e
+  \texttt{reps}$>0$; o resíduo de partida é da ordem de 47~J.
+\end{itemize}
+
+\section{Conclusões}
+
+No algoritmo canônico de benchmark, no maior estado que a máquina comporta:
+
+\begin{enumerate}
+\item o kernel WGSL portátil \textbf{empata com o \texttt{cuStateVec}} quando
+  ambos limitados pela mesma banda de DRAM;
+\item a \textbf{fusão de portas até 6 qubits} é o diferencial de arquitetura
+  ($2{,}43\times$ tempo, $2{,}44\times$ energia acima de 24 qubits) --- e
+  perde abaixo dele, onde a L2 muda o regime;
+\item a \textbf{meia precisão} entrega um qubit a mais ($1{,}96\times$ contra
+  o \texttt{cuStateVec}) e $3{,}3\times$ menos energia, ao custo de uma QFT
+  aproximada cujo erro medido fica em $\sim10^{-3}$;
+\item a \textbf{energia voltou a contradizer o tempo}: a fusão de 2 qubits em
+  \texttt{f16} economiza passadas e gasta watts.
+\end{enumerate}
+
+\appendix
+\section{Reprodutibilidade}
+
+\begin{verbatim}
+# rqubit: QFT completa (verificações + tabela; `tabela` refaz só as medições)
+cargo run -p rqubit --release --example bench_qft
+cargo run -p rqubit --release --example bench_qft -- tabela 27:f32 28:f16
+
+# cuStateVec (venv dedicado, fora do repositório)
+export LD_LIBRARY_PATH=$(find ~/.cache/rgpu-benchmarks/quantum \
+  -name lib -maxdepth 2 -type d | tr '\n' ':')
+python benchmarks/quantum/bench_custatevec_qft.py 28 3 single
+
+# energia do processo externo
+cargo run -p rqubit --release --example medir_externo -- \
+  ~/.cache/rgpu-benchmarks/quantum/bin/python \
+  benchmarks/quantum/bench_custatevec_qft.py 26 6 single
+\end{verbatim}
+
+Máquina: RTX 4070 Laptop (8~GB), Intel Meteor Lake, wgpu/Vulkan, driver NVIDIA
+595.91.07. Versões: burn 0.21, TensorFlow 2.21.0, PyTorch 2.14.0, Qiskit 2.5,
+\texttt{cuquantum-python-cu12}.
+
+\end{document}
