@@ -26,3 +26,46 @@ Regras que valem para qualquer tarefa neste repositório, em qualquer sessão.
 
 O padrão de formato é o das tabelas do [README.md](README.md): condições no
 cabeçalho, **negrito** no vencedor da linha, unidades explícitas.
+
+## Motivação do usuário
+
+A pergunta de fundo por trás de todo o interesse em GPU sem CUDA e em medir
+energia (não só tempo) neste repositório é **exergia**, não energia bruta:
+quanto do trabalho computacional é aproveitado de verdade contra quanto vira
+perda — porque o produto final é **portátil e alimentado por bateria**. Um
+robô ou dispositivo de borda carrega a energia consigo; cada joule gasto em
+ociosidade de GPU, em despacho de software mal ajustado ou numa métrica de
+eficiência enganosa (como o caso do TensorFlow, ver README) é peso e volume
+de bateria que o produto não devia precisar carregar.
+
+Isso não é preocupação abstrata de eficiência de laboratório — é restrição
+de engenharia real: o equipamento não pode precisar de mais bateria, em peso
+e volume, do que ele mesmo.
+
+## Direção futura (contexto, não roteiro — nada disto foi iniciado)
+
+O usuário já possui hardware de borda para explorar esse eixo, ainda não
+auditado neste repositório:
+
+- **Raspberry Pi 5 + Hailo** (acelerador de inferência dedicado, ~2,5 W
+  típico) — alvo primário para inferência de borda.
+- **Jetson Nano** — alternativa caso o par RPi5+Hailo se mostre insuficiente.
+
+A arquitetura de destino que o usuário descreve é em três camadas
+(edge-fog-cloud):
+
+1. **Borda** — inferência simples e rápida, decisões repetitivas sem
+   depender de servidor; envia percepções para a camada seguinte só quando
+   necessário.
+2. **Rede local** — processamento mais pesado, menos urgente, com
+   armazenamento para dezenas de aparelhos.
+3. **Serviço central** — armazenamento e processamento massivo, aprende com
+   a arquitetura inteira e retroalimenta preventivamente as camadas
+   inferiores com o que aprendeu.
+
+Hipótese de trabalho ainda não testada, levantada nesta sessão: cada camada
+tende a rodar em hardware de fabricante diferente (Hailo na borda, GPU de
+data center no topo), o que reabre a mesma pergunta central deste
+repositório — uma pilha portátil (o equivalente do que se fez aqui com
+WGSL/`wgpu`) pode evitar reescrever o modelo três vezes, uma por camada.
+Nada disso foi medido; fica registrado para quando a investigação começar.
