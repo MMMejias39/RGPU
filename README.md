@@ -268,6 +268,15 @@ funciona. O contorno é a saída por slots de workgroup com cópias planas, cust
 de ~6%. Detalhes, incluindo um artefato de medição cometido e registrado no
 percurso, em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
 
+**A alternativa sem nenhum dos dois preços foi testada, e não pagou.**
+`Features::SUBGROUP` do wgpu é estável — não exige `unsafe` nem `f16` — e uma
+sonda isolada (`examples/sonda_subgrupo.rs`) mediu um encaixe real no laço do
+GEMM: +3% a +9% trocando releituras de `A` na memória compartilhada por
+`subgroupShuffle`. Implementado no kernel completo e medido no mesmo processo
+contra a versão em produção, o ganho virou ruído: −3,4% a +2,5%, média −0,7%
+em 8 execuções. Revertido; números completos em
+[RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+
 ### Reproduzindo
 
 ```bash
@@ -757,10 +766,11 @@ Resumo das tentativas, com o estado atual:
 | Padding contra conflito de bancos | nulo | mantido, sem crédito |
 | Fusão genérica em 3 e 4 qubits | −9% e −22% apesar de menos portas | substituída pelas especializadas |
 | Precisão mista `f16` (GEMM) | +1 a 7% de velocidade, −5 a 11% de energia | mantida por capacidade, não por velocidade |
+| GEMM com `A` via `subgroupShuffle` | sonda isolada +3 a 9% (real); kernel completo −3,4% a +2,5%, média −0,7% | [revertido](experimentos/gemm-subgrupo/) |
 | **Retificado** | | |
 | Matriz cooperativa (tensor cores) | "não funcional" era diagnóstico errado: **funciona**, +37 a +50% em 4096³ | decisão pendente: exige `unsafe` e operandos `f16` |
 
-São **dez** otimizações que não pagaram, cada uma com números e causa
+São **onze** otimizações que não pagaram, cada uma com números e causa
 identificada, ao lado das que pagaram. O código revertido fica preservado em
 [`experimentos/`](experimentos/), para que ninguém refaça a tentativa e para
 que quem discordar de uma rejeição possa medir.

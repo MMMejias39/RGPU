@@ -137,10 +137,25 @@ contra 3.804–4.243 do escalar — **+37% a +50%** — e empata em 2048³. Paga
 dois preços (`unsafe` e `f16`) por isso é uma decisão que agora tem número.
 Detalhes em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
 
+A alternativa sem nenhum dos dois preços foi testada e não pagou.
+`Features::SUBGROUP` é estável, não exige `unsafe` nem `f16`, e uma sonda
+isolada (`examples/sonda_subgrupo.rs`) mediu um encaixe real: dentro de um
+subgrupo de 32 lanes, o valor de `A` no laço interno tem exatamente 32
+combinações de (linha, passo de K) — uma por lane —, trocando 16 leituras da
+memória compartilhada por 1 leitura mais `subgroupShuffle`, com ganho de +3%
+a +9% (8 execuções, sempre positivo). Implementado no kernel completo, o
+ganho não sobreviveu: -3,4% a +2,5% (8 execuções, média -0,7%, dentro do
+ruído) — os registradores extras por lane competem com o acumulador 4×4 e o
+buffer duplo já existentes. Revertido; kernel e números em
+[RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md) e
+[`experimentos/gemm-subgrupo/`](experimentos/gemm-subgrupo/).
+
 O roteiro clássico está esgotado dentro do WGSL padrão — o GEMM ficou em
 ~4.300 GFLOP/s, ou ~4.900 com Strassen acima de 4096³, contra 3.290 no início,
 **+33% a +49%**. O que resta fora do padrão é o caminho experimental dos tensor
-cores, agora funcional e esperando medição.
+cores, agora funcional e esperando medição — e ele segue sendo o único que
+exige pagar `unsafe` e/ou `f16`; a via sem nenhum dos dois foi tentada e
+fechada.
 
 ## O saldo
 

@@ -48,6 +48,7 @@ negativo tem lugar neste repositório.
 | Fusão até 6 qubits em 22 qubits (QFT) | **−34%** (90,7 ms contra 67,6) | cruzamento medido entre 22 e 24 |
 | Fusão de 2 qubits em `f16` (QFT) | **+11% de tempo**, mas **+34% de energia** | ganho de tempo sem ganho de energia |
 | Matriz cooperativa (tensor cores) | o "não funcional" era diagnóstico errado: **funciona** nas configurações anunciadas; exige `unsafe` e operandos `f16` | sondas mantidas |
+| GEMM com `A` via `subgroupShuffle` | sonda isolada: **+3 a 9%**, real; no kernel completo: **-3,4% a +2,5%** (média -0,7%) | [revertido](experimentos/gemm-subgrupo/) |
 
 ### A QFT em 22 qubits: a fusão até 6 perde, e a de 2 custa watt
 
@@ -177,6 +178,66 @@ somando aritmética real. O primeiro corte não tem buffer duplo nem rasterizaç
 de L2 (o escalar tem ambos); com eles, o teto do desenho comum é a próxima
 medida. O `probe_coop.rs` fica como registro do diagnóstico original e o
 `probe_coop_f16.rs` como prova do funcionamento.
+
+### GEMM com `A` via `subgroupShuffle` — sonda real, kernel completo nulo
+
+A matriz cooperativa cobra dois preços: `unsafe` (a feature exige
+`ExperimentalFeatures::enabled()`, que é `unsafe fn`) e operandos `f16`. A
+feature `SUBGROUP` do wgpu é **estável** — não `EXPERIMENTAL_*` — e não exige
+`unsafe` nem `f16`, disponível neste hardware (`subgroup_min=32,
+subgroup_max=32` na RTX 4070 Laptop, confirmado também no Intel Arc iGPU via
+`examples/probe_gpu.rs`). A pergunta: dá para contornar o gargalo de banda da
+memória compartilhada (`ROTEIRO-GEMM.md`) sem pagar nenhum dos dois preços?
+
+**O encaixe.** Dentro de um subgrupo de 32 lanes, o endereço de `av` no laço
+interno do GEMM depende só de `ty`, que assume **2** valores distintos por
+subgrupo; cruzado com os 16 passos de `K` do ladrilho, dá **32 combinações —
+exatamente o número de lanes**. Cada lane passa a "possuir" um par
+`(b = lane/16, kk_própria = lane%16)`, lê `av` da memória compartilhada **uma
+única vez** por ladrilho (contra 16 antes) e usa `subgroupShuffle` para as
+outras 15 iterações. `B` não tem esse encaixe (16 endereços × 16 passos = 256
+combinações para 32 lanes) e ficou como estava.
+
+**A sonda isolada confirmou o encaixe.** `examples/sonda_subgrupo.rs`
+reproduz só o padrão de leitura de `av` — mesma aritmética, mesma contagem de
+acessos — comparando a via da memória compartilhada com a via
+`subgroupShuffle`:
+
+| Execução | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Ganho | +5,7% | +9,4% | +9,3% | +4,6% | +6,1% | +6,9% | +5,7% | +3,2% |
+
+Positivo nas 8 execuções, média ~6% — um resultado real, e uma pista de que a
+leitura de `av` (já quase de graça, endereço em broadcast — ver
+`banda_compartilhada.rs`) tinha, mesmo assim, uma pequena margem na **contagem
+de instruções** do laço, não na banda.
+
+**Implementado no kernel de produção, o efeito desaparece.** `MM_FAST` foi
+reescrito com a técnica acima (workgroup 1-D, `local_invocation_index` no
+lugar de `local_invocation_id` — `@builtin(subgroup_invocation_id)` não é
+aceito pelo naga 30.0.1 com workgroup multidimensional), passou pelos 12
+testes de `tests/gpu.rs`, incluindo `gemm_confere_em_todas_as_variantes_e_dimensoes`
+e o treino ponta a ponta. Medido no mesmo processo contra `MM_FAST`, 4096³,
+grupo_l2=8, 8 execuções:
+
+| Execução | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Ganho | +2,5% | +2,0% | -1,6% | -2,3% | +1,3% | -1,7% | -2,7% | -3,4% |
+
+Sinal alterna, cruza o zero, sem tendência — média **-0,7%**. **Dentro do
+ruído**, apesar de o mesmo padrão isolado ter sido positivo nas 8 vezes em que
+foi medido sozinho. A leitura mais provável: a economia de instruções de
+carga é real, mas no kernel completo ela compete por registradores com o
+acumulador 4×4 e o buffer duplo já existentes (`av_reg`, `base`,
+`kk_propria` são registradores extras por lane), e o que se ganha de um lado
+se perde do outro — o mesmo padrão de "diagnóstico certo, peso
+superestimado" da tabela "O padrão" acima (cache de descritores, redução de
+coluna, padding de bancos, bloco 8×8, leituras `vec4`).
+
+Revertido de `gemm.rs`; o kernel correto e mensurável fica preservado em
+[`experimentos/gemm-subgrupo/`](experimentos/gemm-subgrupo/). A sonda isolada
+(`examples/sonda_subgrupo.rs`) continua no repositório — o achado dela é real,
+só não se propaga ao kernel completo.
 
 ### GEMM especializado para formas alinhadas — sem efeito
 
