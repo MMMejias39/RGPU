@@ -292,6 +292,16 @@ O erro numérico não muda (mesma conversão `f16`, mesma acumulação `f32`) �
 só o padrão de acesso à memória. `+63%` sobre o kernel escalar em produção
 (4.386 GFLOP/s), contra os +37–50% do primeiro corte.
 
+**O que ainda sobra na mesa:** o teto puro de `coopMultiplyAdd` — a mesma
+aritmética sem nenhuma leitura de memória nova — mede **36 a 45,5 TFLOP/s**
+(`examples/ocupacao_coop.rs`). O GEMM real usa só **~18–20%** disso. Três
+hipóteses testadas e refutadas (memória de workgroup, `coopLoadT` repetido,
+banda de memória global sozinha) e uma quarta inconclusiva (antecipação mais
+profunda, 3 ladrilhos em vez de 2) não fecharam a conta — a causa exata
+continua em aberto, provavelmente exigindo um perfilador de ocupação que
+este projeto não usa. Detalhes e as quatro sondas em
+[RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+
 Dois preços, e agora são os únicos obstáculos:
 
 1. **`unsafe`.** Habilitar a feature exige `ExperimentalFeatures::enabled()`,

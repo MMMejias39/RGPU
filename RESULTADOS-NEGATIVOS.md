@@ -220,6 +220,77 @@ Os dois preços continuam os mesmos — `unsafe` e operandos `f16` — e não h�
 nada nesta medida que os elimine. O que muda é o número que a decisão pesa: a
 matriz cooperativa agora está a 1,67× do cuBLAS, não a 2×.
 
+### À procura do próximo gargalo: três hipóteses refutadas, uma inconclusiva
+
+Com buffer duplo e rasterização L2, o GEMM cooperativo mede ~7.150 GFLOP/s
+em 4096³. `examples/ocupacao_coop.rs` mediu o teto puro de `coopMultiplyAdd`
+— a mesma aritmética, sem nenhuma leitura de memória nova — em **36 a 45,5
+TFLOP/s** (8 execuções, faixa larga pela deriva de clock já documentada).
+O GEMM real usa só **~18–20%** desse teto. É uma folga bem maior que a do
+kernel escalar antes das otimizações de banda (lá, ~25–28% do teto de FMA
+pura). Quatro hipóteses foram testadas para explicar a distância, cada uma
+com uma sonda isolada e descartável:
+
+**1. Memória de workgroup (`sc`, 16 KB do total de 24 KB) reduz ocupação —
+refutada.** `examples/ocupacao_coop_memoria.rs` soma um array de
+preenchimento ao orçamento de memória de workgroup, de 2 KB até 40 KB, sem
+tocar a aritmética cronometrada. Vazão **idêntica** em toda a faixa —
+inclusive nos 24 KB exatos do kernel real (45.052,6 GFLOP/s contra
+45.403,1 GFLOP/s a 4 KB). Se ocupação por memória de workgroup fosse o
+limite, teria de aparecer aqui, e não aparece.
+
+**2. `coopLoadT` repetido a cada passo é caro — refutada.**
+`examples/ocupacao_coop_load.rs` compara carregar `ma`/`mb` uma vez fora do
+laço (como a sonda 1) contra carregar a cada iteração (como o kernel real,
+do mesmo endereço fixo). Sem perda: 35.718,8 contra 43.829,7 GFLOP/s — a
+segunda até mais rápida, dentro do ruído.
+
+**3. Banda de memória global sozinha — refutada.** `examples/banda_coop.rs`
+reproduz o padrão de acesso exato do kernel real — mesmos endereços, mesma
+rasterização L2, mesmo buffer duplo, mesmo despacho — removendo só
+`coopLoadT`/`coopMultiplyAdd`/`coopStoreT`. Tempo: **5,07 ms** em 4096³,
+contra 19,1–19,4 ms do kernel completo — quase 4× mais rápido sem tensor
+cores nenhum. Se a banda global sozinha fosse o teto, esse número teria de
+se aproximar dos 19 ms, e fica bem abaixo.
+
+**4. Antecipação mais profunda (3 ladrilhos em vez de 2) — inconclusiva.**
+A hipótese que sobrou das três refutações: nem memória nem aritmética
+isoladas explicam a distância, então é a **interação** entre elas — o
+buffer duplo dá só o tempo de `coopMultiplyAdd` (agora quase instantâneo)
+de folga para a busca do próximo ladrilho terminar, contra o tempo bem maior
+que o FMA escalar levava. `FONTE_PROFUNDA` em `bench_coop.rs` emite a busca
+do ladrilho `t+3` na iteração `t`, mas só a guarda na memória de workgroup ao
+fim da iteração `t+1` — uma iteração inteira de folga, não só o tempo de
+cálculo. Medido no mesmo processo contra o buffer duplo comum, 6 execuções
+em 4096³:
+
+| Execução | novo (buffer 2) | profundo (buffer 3) |
+|---:|---:|---:|
+| 1 | 7.263 | 6.949 |
+| 2 | 7.155 | — |
+| 3 | 7.172 | — |
+| 4 | 7.031 | — |
+| 5 | 7.488 | 6.341 |
+| 6 | 7.286 | 7.191 |
+
+Média de `novo`: 7.346. Média de `profundo`: 6.807 — **~7% pior**, não
+melhor, dentro da mesma faixa de ruído de execução para execução já vista em
+outras sondas. A hipótese de profundidade não se confirmou. Uma explicação
+plausível: `pend_a`/`pend_b` ficam vivos por toda a iteração (registradores
+extras que a versão de 2 buffers não tem), e a pressão de registradores —
+um recurso diferente do que a sonda 1 testou (memória de workgroup) — pode
+estar anulando o ganho de latência escondida. Isso não foi medido
+diretamente; ficaria para uma sonda de ocupação por registrador, análoga a
+`ocupacao.rs`, mas específica de tipos de matriz cooperativa.
+
+**O que fica:** três causas eliminadas com clareza, uma quarta tentativa que
+não rendeu. A causa exata dos ~80% de teto não usado continua em aberto.
+Fixá-la provavelmente exige um perfilador de ocupação real (Nsight Compute
+ou equivalente) — ferramenta que este projeto não usa, por ser específica de
+fabricante. As quatro sondas ficam publicadas: `ocupacao_coop.rs`,
+`ocupacao_coop_memoria.rs`, `ocupacao_coop_load.rs`, `banda_coop.rs`, e a
+terceira variante em `bench_coop.rs`.
+
 ### GEMM com `A` via `subgroupShuffle` — sonda real, kernel completo nulo
 
 A matriz cooperativa cobra dois preços: `unsafe` (a feature exige

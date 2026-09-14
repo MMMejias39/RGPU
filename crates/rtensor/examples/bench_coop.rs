@@ -197,6 +197,181 @@ fn mm(
 }
 "#;
 
+/// Igual a [`FONTE`], mas com **profundidade 3** em vez de buffer duplo (2):
+/// a carga do ladrilho `t+3` é emitida no início da iteração `t`, mas só é
+/// guardada na memória de workgroup ao **fim da iteração seguinte** — uma
+/// iteração inteira de folga para a latência da busca, contra a folga de "só
+/// o tempo de `coopMultiplyAdd`" do buffer duplo comum.
+///
+/// # Por que
+///
+/// `banda_coop.rs` mediu que nem a memória sozinha (5,07 ms) nem os tensor
+/// cores sozinhos (teto de 36–45 TFLOP/s, `ocupacao_coop.rs`) explicam os
+/// 19,1–19,4 ms do kernel completo — a hipótese que sobra é que o buffer
+/// duplo comum não dá folga suficiente agora que o cálculo por passo de `K`
+/// ficou rápido demais para esconder a latência da busca atrás dele.
+const FONTE_PROFUNDA: &str = r#"
+enable f16;
+enable wgpu_cooperative_matrix;
+
+struct Dims { m: u32, n: u32, k: u32, grid_x: u32, grupo: u32, p0: u32, p1: u32, p2: u32 };
+
+@group(0) @binding(0) var<storage, read> a: array<f16>;
+@group(0) @binding(1) var<storage, read> b: array<f16>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> dims: Dims;
+
+// Três ladrilhos, não dois.
+var<workgroup> sa: array<f16, 3072>;
+var<workgroup> sb: array<f16, 3072>;
+var<workgroup> sc: array<f32, 4096>;
+
+fn bloco(pid: u32, nm: u32, nn: u32) -> vec2<u32> {
+    let grupo = max(dims.grupo, 1u);
+    let por_grupo = grupo * nn;
+    let gid = pid / por_grupo;
+    let m0 = gid * grupo;
+    let tam = max(min(nm - m0, grupo), 1u);
+    return vec2<u32>(m0 + (pid % tam), (pid % por_grupo) / tam);
+}
+
+fn carregar_a(m0: u32, k0: u32, ca: u32, ra: u32, K: u32) -> vec4<f16> {
+    return vec4<f16>(
+        a[(m0 + ra) * K + k0 + ca],
+        a[(m0 + ra + 16u) * K + k0 + ca],
+        a[(m0 + ra + 32u) * K + k0 + ca],
+        a[(m0 + ra + 48u) * K + k0 + ca],
+    );
+}
+
+fn guardar_a(buf: u32, ca: u32, ra: u32, v: vec4<f16>) {
+    sa[buf * 1024u + ra * 16u + ca] = v.x;
+    sa[buf * 1024u + (ra + 16u) * 16u + ca] = v.y;
+    sa[buf * 1024u + (ra + 32u) * 16u + ca] = v.z;
+    sa[buf * 1024u + (ra + 48u) * 16u + ca] = v.w;
+}
+
+fn carregar_b(n0: u32, k0: u32, rb: u32, cb: u32, N: u32) -> vec4<f16> {
+    return vec4<f16>(
+        b[(k0 + rb) * N + n0 + cb],
+        b[(k0 + rb) * N + n0 + cb + 1u],
+        b[(k0 + rb) * N + n0 + cb + 2u],
+        b[(k0 + rb) * N + n0 + cb + 3u],
+    );
+}
+
+fn guardar_b(buf: u32, rb: u32, cb: u32, v: vec4<f16>) {
+    sb[buf * 1024u + rb * 64u + cb] = v.x;
+    sb[buf * 1024u + rb * 64u + cb + 1u] = v.y;
+    sb[buf * 1024u + rb * 64u + cb + 2u] = v.z;
+    sb[buf * 1024u + rb * 64u + cb + 3u] = v.w;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn mm(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) l: vec3<u32>,
+) {
+    let M = dims.m;
+    let N = dims.n;
+    let K = dims.k;
+    let nm = dims.grid_x;
+    let nn = N / 64u;
+
+    let bid = bloco(wg.x, nm, nn);
+    let m0 = bid.x * 64u;
+    let n0 = bid.y * 64u;
+    let s = l.x / 32u;
+    let lane = l.x % 32u;
+    let linha = s % 4u;
+    let col0 = (s / 4u) * 2u;
+
+    let base_ma = linha * 256u;
+    let base_mb0 = col0 * 16u;
+    let base_mb1 = (col0 + 1u) * 16u;
+    let slot = s * 512u;
+    let base_c = (m0 + linha * 16u) * N + n0 + col0 * 16u;
+
+    let ca = l.x % 16u;
+    let ra = l.x / 16u;
+    let rb = l.x / 16u;
+    let cb = (l.x % 16u) * 4u;
+
+    for (var i = lane; i < 512u; i = i + 32u) {
+        sc[slot + i] = 0.0;
+    }
+    workgroupBarrier();
+    var mc0 = coopLoadT<coop_mat16x16<f32, C>>(&sc[slot], 16u);
+    var mc1 = coopLoadT<coop_mat16x16<f32, C>>(&sc[slot + 256u], 16u);
+
+    let passos = K / 16u;
+
+    // Aquecimento: ladrilhos 0 e 1 guardados de cara.
+    guardar_a(0u, ca, ra, carregar_a(m0, 0u, ca, ra, K));
+    guardar_b(0u, rb, cb, carregar_b(n0, 0u, rb, cb, N));
+    let tem_t1 = 1u < passos;
+    if (tem_t1) {
+        guardar_a(1u, ca, ra, carregar_a(m0, 16u, ca, ra, K));
+        guardar_b(1u, rb, cb, carregar_b(n0, 16u, rb, cb, N));
+    }
+    workgroupBarrier();
+
+    // Ladrilho 2 emitido antes do laço — fica pendente uma iteração inteira.
+    var pend_a: vec4<f16>;
+    var pend_b: vec4<f16>;
+    let tem_t2 = 2u < passos;
+    if (tem_t2) {
+        pend_a = carregar_a(m0, 32u, ca, ra, K);
+        pend_b = carregar_b(n0, 32u, rb, cb, N);
+    }
+
+    var cur = 0u;
+    for (var t = 0u; t < passos; t = t + 1u) {
+        let ab = cur * 1024u + base_ma;
+        let bb0 = cur * 1024u + base_mb0;
+        let bb1 = cur * 1024u + base_mb1;
+        let ma = coopLoadT<coop_mat16x16<f16, A>>(&sa[ab], 16u);
+        let mb0 = coopLoadT<coop_mat16x16<f16, B>>(&sb[bb0], 64u);
+        let mb1 = coopLoadT<coop_mat16x16<f16, B>>(&sb[bb1], 64u);
+        mc0 = coopMultiplyAdd(ma, mb0, mc0);
+        mc1 = coopMultiplyAdd(ma, mb1, mc1);
+
+        // Emite a busca do ladrilho t+3 agora — só vai ser consumida daqui a
+        // uma iteração inteira, não nesta.
+        let tem_prox = t + 3u < passos;
+        var nova_pend_a: vec4<f16>;
+        var nova_pend_b: vec4<f16>;
+        if (tem_prox) {
+            nova_pend_a = carregar_a(m0, (t + 3u) * 16u, ca, ra, K);
+            nova_pend_b = carregar_b(n0, (t + 3u) * 16u, rb, cb, N);
+        }
+
+        // Guarda o pendente da iteração anterior (ladrilho t+2) — já teve
+        // uma iteração inteira de folga.
+        let tem_pend = t + 2u < passos;
+        if (tem_pend) {
+            guardar_a((t + 2u) % 3u, ca, ra, pend_a);
+            guardar_b((t + 2u) % 3u, rb, cb, pend_b);
+        }
+
+        workgroupBarrier();
+        cur = (cur + 1u) % 3u;
+        pend_a = nova_pend_a;
+        pend_b = nova_pend_b;
+    }
+
+    coopStoreT(mc0, &sc[slot], 16u);
+    coopStoreT(mc1, &sc[slot + 256u], 16u);
+    workgroupBarrier();
+    for (var i = lane; i < 256u; i = i + 32u) {
+        c[base_c + (i / 16u) * N + i % 16u] = sc[slot + i];
+    }
+    for (var i = lane; i < 256u; i = i + 32u) {
+        c[base_c + 16u + (i / 16u) * N + i % 16u] = sc[slot + 256u + i];
+    }
+}
+"#;
+
 /// O primeiro corte, sem buffer duplo nem rasterização L2 — preservado aqui
 /// só para a comparação lado a lado, no mesmo processo, contra `FONTE`. Mede
 /// **5.756–5.988 GFLOP/s em 4096³** no README; ver ali para a origem.
@@ -371,7 +546,11 @@ fn main() {
     // RESULTADOS-NEGATIVOS.md.
     println!("{:>10} {:>7} | {:>9} | {:>5}", "kernel", "N", "GFLOP/s", "ms");
     let mut base: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
-    for (nome, fonte, tem_grupo) in [("antigo", FONTE_ANTIGA, false), ("novo", FONTE, true)] {
+    for (nome, fonte, tem_grupo) in [
+        ("antigo", FONTE_ANTIGA, false),
+        ("novo (buffer 2)", FONTE, true),
+        ("profundo (buffer 3)", FONTE_PROFUNDA, true),
+    ] {
         let m = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(nome),
             source: wgpu::ShaderSource::Wgsl(fonte.into()),
