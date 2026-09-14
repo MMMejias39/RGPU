@@ -136,6 +136,17 @@ struct Porta2P {
     u: [f32; 32],
 }
 
+/// Parâmetros do produto interno: total de amplitudes, largura da grade
+/// (para a grade 2-D) e quantos workgroups escreveram parciais.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ProdutoP {
+    amplitudes: u32,
+    gx: u32,
+    blocos: u32,
+    pad: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PortaP {
@@ -474,6 +485,138 @@ fn porta2(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: 
 "#;
 
 /// Vetor de estado de `n` qubits, residente na GPU.
+/// Kernel do produto interno entre dois estados, etapa 1: cada workgroup
+/// reduz 4096 amplitudes — `⟨a|b⟩ = Σₐ conj(a)·b` — e escreve uma parcial.
+/// Leitura pura: nenhum dos estados é modificado. Duas leituras por amplitude,
+/// sem escrita no estado: numa carga limitada por banda, é o dobro dos bytes
+/// de uma porta, e o resultado é um único complexo.
+///
+/// Os parciais sobrevivem numa segunda etapa (`PRODUTO2`), que reduz até
+/// 65.536 parciais num único workgroup e escreve o resultado.
+const PRODUTO: &str = r#"
+struct P {
+    amplitudes: u32, gx: u32, blocos: u32, pad: u32,
+};
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> a: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> b: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read_write> parciais: array<vec2<f32>>;
+
+var<workgroup> tre: array<f32, 256>;
+var<workgroup> tim: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn soma1(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+    var acc = vec2<f32>(0.0, 0.0);
+    let inicio = (w.y * p.gx + w.x) * 4096u;
+    for (var k = 0u; k < 16u; k = k + 1u) {
+        let i = inicio + k * 256u + l.x;
+        if (i < p.amplitudes) {
+            let ca = a[i];
+            let cb = b[i];
+            acc = acc + vec2<f32>(ca.x * cb.x + ca.y * cb.y, ca.x * cb.y - ca.y * cb.x);
+        }
+    }
+    tre[l.x] = acc.x;
+    tim[l.x] = acc.y;
+    workgroupBarrier();
+    var passo = 128u;
+    loop {
+        if (passo == 0u) { break; }
+        if (l.x < passo) {
+            tre[l.x] = tre[l.x] + tre[l.x + passo];
+            tim[l.x] = tim[l.x] + tim[l.x + passo];
+        }
+        workgroupBarrier();
+        passo = passo / 2u;
+    }
+    if (l.x == 0u) {
+        parciais[w.y * p.gx + w.x] = vec2<f32>(tre[0], tim[0]);
+    }
+}
+"#;
+
+/// Etapa 1 em meia precisão: amplitudes empacotadas, duas por palavra.
+const PRODUTO_F16: &str = r#"
+struct P {
+    amplitudes: u32, gx: u32, blocos: u32, pad: u32,
+};
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> a: array<u32>;
+@group(0) @binding(2) var<storage, read> b: array<u32>;
+@group(0) @binding(3) var<storage, read_write> parciais: array<vec2<f32>>;
+
+var<workgroup> tre: array<f32, 256>;
+var<workgroup> tim: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn soma1(@builtin(workgroup_id) w: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+    var acc = vec2<f32>(0.0, 0.0);
+    let inicio = (w.y * p.gx + w.x) * 4096u;
+    for (var k = 0u; k < 16u; k = k + 1u) {
+        let i = inicio + k * 256u + l.x;
+        if (i < p.amplitudes) {
+            let va = unpack2x16float(a[i]);
+            let vb = unpack2x16float(b[i]);
+            acc = acc + vec2<f32>(va.x * vb.x + va.y * vb.y, va.x * vb.y - va.y * vb.x);
+        }
+    }
+    tre[l.x] = acc.x;
+    tim[l.x] = acc.y;
+    workgroupBarrier();
+    var passo = 128u;
+    loop {
+        if (passo == 0u) { break; }
+        if (l.x < passo) {
+            tre[l.x] = tre[l.x] + tre[l.x + passo];
+            tim[l.x] = tim[l.x] + tim[l.x + passo];
+        }
+        workgroupBarrier();
+        passo = passo / 2u;
+    }
+    if (l.x == 0u) {
+        parciais[w.y * p.gx + w.x] = vec2<f32>(tre[0], tim[0]);
+    }
+}
+"#;
+
+/// Etapa 2: reduz até 65.536 parciais num único workgroup.
+const PRODUTO2: &str = r#"
+struct P {
+    blocos: u32, pad0: u32, pad1: u32, pad2: u32,
+};
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> parciais: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> saida: array<vec2<f32>>;
+
+var<workgroup> tre2: array<f32, 256>;
+var<workgroup> tim2: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn soma2(@builtin(local_invocation_id) l: vec3<u32>) {
+    var acc = vec2<f32>(0.0, 0.0);
+    for (var k = l.x; k < p.blocos; k = k + 256u) {
+        acc = acc + parciais[k];
+    }
+    tre2[l.x] = acc.x;
+    tim2[l.x] = acc.y;
+    workgroupBarrier();
+    var passo = 128u;
+    loop {
+        if (passo == 0u) { break; }
+        if (l.x < passo) {
+            tre2[l.x] = tre2[l.x] + tre2[l.x + passo];
+            tim2[l.x] = tim2[l.x] + tim2[l.x + passo];
+        }
+        workgroupBarrier();
+        passo = passo / 2u;
+    }
+    if (l.x == 0u) {
+        saida[0] = vec2<f32>(tre2[0], tim2[0]);
+    }
+}
+"#;
+
 pub struct Estado {
     qubits: usize,
     precisao: Precisao,
@@ -485,11 +628,13 @@ pub struct Estado {
     pipeline4: wgpu::ComputePipeline,
     pipeline5: wgpu::ComputePipeline,
     pipeline6: wgpu::ComputePipeline,
+    pipeline_produto: wgpu::ComputePipeline,
+    pipeline_produto2: wgpu::ComputePipeline,
 }
 
 impl Estado {
     /// Teto de qubits em precisão simples, imposto pelo limite de 2 GB por
-    /// binding. Em meia precisão são 29 — ver [`Precisao::max_qubits`].
+    /// binding. Em meia precisão são 28 — ver [`Precisao::max_qubits`].
     pub const MAX_QUBITS: usize = 27;
 
     /// Cria o estado `|0…0⟩` em precisão simples.
@@ -625,6 +770,28 @@ impl Estado {
         let pipeline5 = especializado(porta_n::PORTA5, "porta5");
         let pipeline6 = especializado(porta_n::PORTA6, "porta6");
 
+        let fonte_produto = match precisao {
+            Precisao::F32 => PRODUTO,
+            Precisao::F16 => PRODUTO_F16,
+        };
+        let modulo_produto = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("produto"),
+            source: wgpu::ShaderSource::Wgsl(fonte_produto.into()),
+        });
+        let produto = |entrada: &str| {
+            gpu.device()
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(entrada),
+                    layout: None,
+                    module: &modulo_produto,
+                    entry_point: Some(entrada),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+        };
+        let pipeline_produto = produto("soma1");
+        let pipeline_produto2 = especializado(PRODUTO2, "soma2");
+
         Ok(Estado {
             qubits,
             precisao,
@@ -636,6 +803,8 @@ impl Estado {
             pipeline4,
             pipeline5,
             pipeline6,
+            pipeline_produto,
+            pipeline_produto2,
         })
     }
 
@@ -809,6 +978,114 @@ impl Estado {
         };
         drop(vista);
         saida
+    }
+
+    /// `⟨a|b⟩` entre este estado e `outro`, por redução em dois estágios.
+    ///
+    /// Leitura pura: nenhum dos dois estados é modificado, então o mesmo par
+    /// pode ser reusado — é o que permite calcular uma matriz de kernel sem
+    /// recriar estados. Tráfego de duas leituras por amplitude: em 28 qubits
+    /// em meia precisão, ~2 GB por medição, governado por banda como o resto.
+    ///
+    /// Para estados em `f16`, o resultado carrega o erro da meia precisão
+    /// das amplitudes. Na superposição uniforme o desvio medido de `⟨ψ|ψ⟩`
+    /// foi **zero** — a cascata de Hadamards sobre `|0…0⟩` produz amplitudes
+    /// que são potências exatas de dois, exatas em `f16`. Com rotações, cujos
+    /// senos não são representáveis, o desvio medido é de **−1,2·10⁻³ em 12
+    /// qubits e −4,3·10⁻⁴ em 28** (`tests/produto_interno.rs`).
+    pub fn produto_interno(&self, gpu: &Gpu, outro: &Estado) -> (f32, f32) {
+        assert_eq!(self.qubits, outro.qubits, "estados de tamanhos diferentes");
+        assert_eq!(self.precisao, outro.precisao, "estados em precisões diferentes");
+
+        let amplitudes = self.amplitudes();
+        let blocos = amplitudes.div_ceil(4096);
+        // Cada dimensão da grade vai até 65.535 workgroups.
+        let (gx, gy) = if blocos <= 65535 {
+            (blocos as u32, 1u32)
+        } else {
+            (65535, blocos.div_ceil(65535) as u32)
+        };
+
+        let params = ProdutoP {
+            amplitudes: amplitudes as u32,
+            gx,
+            blocos: blocos as u32,
+            pad: 0,
+        };
+        let uniforme = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("produto"),
+            size: std::mem::size_of::<ProdutoP>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue().write_buffer(&uniforme, 0, bytemuck::bytes_of(&params));
+        let parciais = gpu.buffer_bruto(blocos * 2, "parciais");
+        let saida = gpu.buffer_bruto(2, "produto");
+
+        let bind1 = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("produto1"),
+            layout: &self.pipeline_produto.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforme.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: outro.buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: parciais.as_entire_binding() },
+            ],
+        });
+        let bind2 = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("produto2"),
+            layout: &self.pipeline_produto2.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforme.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: parciais.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: saida.as_entire_binding() },
+            ],
+        });
+
+        let mut enc = gpu.encoder();
+        {
+            let mut passe = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("produto1"),
+                timestamp_writes: None,
+            });
+            passe.set_pipeline(&self.pipeline_produto);
+            passe.set_bind_group(0, &bind1, &[]);
+            passe.dispatch_workgroups(gx, gy, 1);
+        }
+        {
+            let mut passe = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("produto2"),
+                timestamp_writes: None,
+            });
+            passe.set_pipeline(&self.pipeline_produto2);
+            passe.set_bind_group(0, &bind2, &[]);
+            passe.dispatch_workgroups(1, 1, 1);
+        }
+        gpu.queue().submit(Some(enc.finish()));
+
+        let leitura = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("produto_leitura"),
+            size: 8,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc2 = gpu.encoder();
+        enc2.copy_buffer_to_buffer(&saida, 0, &leitura, 0, 8);
+        gpu.queue().submit(Some(enc2.finish()));
+
+        let slice = leitura.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        rx.recv().expect("canal").expect("map");
+        let vista = slice.get_mapped_range().expect("range");
+        let cru: Vec<f32> = bytemuck::cast_slice(&vista[..]).to_vec();
+        drop(vista);
+        (cru[0], cru[1])
     }
 }
 
