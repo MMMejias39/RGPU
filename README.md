@@ -167,8 +167,20 @@ sobre o ladrilho `t`, escondendo a latência da memória atrás da aritmética.
 | ladrilhado | 3.290 |
 | ladrilhado + buffer duplo | 4.230 |
 | + rasterização com consciência de L2 | **4.386** |
-| cuBLAS, com TF32 | 11.946 |
-| cuBLAS (via TensorFlow, com TF32) | 11.946 |
+| cuBLAS, com TF32 (via TensorFlow) | 11.946 |
+
+*Ressalva:* o número do cuBLAS acima foi medido chamando `tf.matmul` num laço
+— a mesma metodologia que a seção de despacho, mais abaixo, mede em **~30% de
+overhead de Python** nos passos de treino. A mesma multiplicação 2048³ com
+TF32, via PyTorch (despacho quase nulo, já medido): **15.357–18.305
+GFLOP/s** — 28% a 53% acima do número citado. Em 8192³, onde o overhead fixo
+pesa menos por chamada, os dois se aproximam: TensorFlow sobe a 14.002,
+PyTorch a 17.526 — a distância cai de ~30% para ~20%, mas não fecha, o que
+sugere um resto que não é só despacho (talvez heurística de algoritmo do
+cuBLAS diferente entre as duas bibliotecas). **Toda comparação "distância do
+cuBLAS" neste documento usa o número mais baixo (11.946) como referência — a
+distância real é maior, não menor.** Metodologia completa em
+[RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
 
 A rasterização segue a blocagem de L2 do Goto na forma que uma GPU permite: não
 se controla a cache, controla-se a **ordem em que os blocos a visitam**. Em vez
@@ -246,9 +258,12 @@ Por perder abaixo de 4096, Strassen não é automático: `Strassen::novo` monta 
 plano explicitamente. `tests/gpu.rs` mede o erro extra a cada execução, em vez
 de supô-lo.
 
-Ainda 2,7× atrás do cuBLAS. Mas com o TF32 desligado o TensorFlow cai só 12%, o
-que localiza a maior parte da diferença em pipelining, tiling multinível e
-swizzling — todos ao alcance do WGSL — e não nos tensor cores.
+Ainda 2,7× atrás do cuBLAS — na verdade mais, já que o número de referência
+subestima o teto real (ver a ressalva na tabela do GEMM, acima). Mas com o
+TF32 desligado o TensorFlow cai só 12% — comparação interna ao TensorFlow,
+que não sofre do mesmo viés —, o que localiza a maior parte da diferença em
+pipelining, tiling multinível e swizzling — todos ao alcance do WGSL — e não
+nos tensor cores.
 
 ### Tensor cores (matriz cooperativa)
 
@@ -290,7 +305,9 @@ execuções:
 
 O erro numérico não muda (mesma conversão `f16`, mesma acumulação `f32`) —
 só o padrão de acesso à memória. `+63%` sobre o kernel escalar em produção
-(4.386 GFLOP/s), contra os +37–50% do primeiro corte.
+(4.386 GFLOP/s), contra os +37–50% do primeiro corte. A distância do cuBLAS
+citada usa o número de referência medido via TensorFlow, que a ressalva da
+seção "GEMM" acima mostra estar subestimado — 1,67× é piso, não teto.
 
 **O que ainda sobra na mesa:** o teto puro de `coopMultiplyAdd` — a mesma
 aritmética sem nenhuma leitura de memória nova — mede **36 a 45,5 TFLOP/s**

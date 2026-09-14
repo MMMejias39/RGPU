@@ -48,6 +48,8 @@ comparação com `fusion_enable=on` deixou de ser assimétrica.
 | `bench_custatevec.py` | `bench_custatevec.py <qubits> <portas> <single\|double>` |
 | `bench_aer_camadas.py` | Circuito em camadas, igual ao de `bench_fusao.rs` |
 | `bench_custatevec_camadas.py` | O mesmo circuito, no cuStateVec |
+| `despacho_custatevec.py` | Isola o despacho Python/cuquantum do tempo real de kernel — checado e descartado como confundidor, ver RESULTADOS-NEGATIVOS.md |
+| `despacho_aer.py` | O mesmo para o Aer — também sem confundidor |
 
 ## Energia
 

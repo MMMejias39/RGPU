@@ -36,6 +36,8 @@ export LD_LIBRARY_PATH=$(find venv/lib/python3.12/site-packages/nvidia \
 | `frio_decomposto_torch.py` | O mesmo para PyTorch — usado para separar imposto de import de arquitetura na comparação de partida a fria |
 | `despacho_tf.py` | `despacho_tf.py <lote>` — isola o custo de despachar uma `tf.function` traçada (corpo trivial) do custo do passo real, no regime permanente |
 | `despacho_torch.py` | `despacho_torch.py <lote>` — o mesmo para PyTorch eager |
+| `despacho_gemm_cublas.py` | Mede `C[2048³]` TF32 via PyTorch, para checar se o teto do cuBLAS citado (medido via TensorFlow) está subestimado por despacho — ver RESULTADOS-NEGATIVOS.md |
+| `energia_tf.py` / `energia_torch.py` | Energia por passo (`<lote> <passos>`), medidos por fora com `rqubit::examples::medir_externo` por diferença entre duas contagens de passos |
 | `tf32_probe.py` | Liga e desliga os tensor cores TF32 para medir quanto eles valem |
 
 ## Uso

@@ -628,6 +628,72 @@ GPU; cerca de um terço disso é o mesmo imposto de linguagem hospedeira já
 identificado na partida a fria, só que pago a cada passo em vez de uma vez
 só.
 
+### O teto do cuBLAS citado no README também estava medido via TensorFlow
+
+Depois de confirmar o overhead de despacho na tabela de regime permanente, a
+pergunta óbvia: o número do **cuBLAS** — citado repetidas vezes como o teto
+de referência ("2,7× atrás do cuBLAS", "1,67× do cuBLAS") — foi medido como?
+Resposta: `suite_tf.py gemm gpu`, que chama `tf.matmul` num `tf.function`
+traçado, dentro do mesmo laço de 20 chamadas com sincronização única no fim
+que já mostrou ~30% de despacho nos passos de treino.
+
+`benchmarks/python/despacho_gemm_cublas.py` mede a mesma multiplicação
+`C[2048³]` com TF32, mas via PyTorch (despacho já medido como quase nulo).
+3 execuções de cada, mesma máquina, mesma sessão:
+
+| Motor | GFLOP/s (2048³) |
+|---|---:|
+| TensorFlow (`tf.matmul`, laço de 20) | 11.938,9 / 12.217,0 / 11.997,1 |
+| PyTorch (`torch.matmul`, laço de 20) | 18.304,7 / 15.392,7 / 15.413,4 |
+
+O número citado no README (11.946) é essencialmente o mesmo que o
+TensorFlow reproduz aqui — mas o PyTorch, na mesma placa, no mesmo momento,
+mede **28% a 53% mais alto**. **A confirmação de que é overhead fixo, não
+uma diferença de biblioteca**: repetindo em `C[8192³]`, onde cada chamada
+demora muito mais e o custo fixo pesa proporcionalmente menos, a distância
+cai de ~30% para ~20% (TensorFlow 14.002,0 GFLOP/s contra PyTorch 17.525,7)
+— sem fechar de todo, o que sugere um resto que não é só despacho, talvez
+heurística de seleção de algoritmo do cuBLAS diferente entre as duas
+bibliotecas (`cuBLASLt` permite escolher entre vários kernels por forma, e
+TensorFlow e PyTorch podem não escolher o mesmo).
+
+**Isto não é um erro de medição isolado — é sistêmico.** O README cita
+"cuBLAS, com TF32" como se fosse uma medida direta e neutra do hardware, mas
+a medida vem da mesma pilha que já provou ter despacho caro. Toda vez que o
+documento diz "X× atrás do cuBLAS", está comparando contra um número
+**subestimado**: a distância real para o cuBLAS de verdade é maior, não
+menor, do que qualquer fator citado neste repositório sugere. Isso não muda
+o veredito de nenhuma comparação (o cuBLAS já vencia em todos os casos onde
+é citado) — muda só o tamanho da vitória dele, que é maior do que consta.
+
+Não foi corrigido o número em si (chamar `tf.matmul` via TensorFlow é a
+metodologia mais direta de obter TF32 sem escrever um binário C++ com
+cuBLASLt cru, e substituí-la por PyTorch traria uma dependência nova só para
+esta medida) — foi só marcado, no README, que a distância real é maior.
+
+### cuStateVec e Aer: a mesma pergunta, sem o mesmo problema
+
+Com o TensorFlow mostrando ~30% de despacho e o teto do cuBLAS citado
+também vindo de lá, a pergunta simétrica: os comparativos de simulação
+quântica (`cuStateVec`, Qiskit Aer) — também acessados por bindings Python —
+sofrem do mesmo problema? Testado com `despacho_custatevec.py` e
+`despacho_aer.py`, mesma técnica (chamada trivial contra chamada real):
+
+| Motor | qubits | despacho, % do tempo real |
+|---|---:|---:|
+| cuStateVec | 22 / 24 / 26 / 27 | 3,0% / 0,3% / 0,1% / 0,0% |
+| Aer (CPU) | 22 / 24 / 26 | 2,7% / 1,4% / 0,3% |
+
+**Não há confundidor aqui.** As duas bibliotecas evitam o padrão que pegou o
+TensorFlow, por desenhos diferentes: o `cuquantum` faz uma chamada Python
+fina por porta, direto para a API C — sem grafo, sem traçado —, e o Aer
+monta o circuito inteiro e transpila **uma vez**, com uma única chamada
+Python (`sim.run`) cobrindo todas as portas do circuito. Nos dois casos, o
+custo fixo de cruzar a fronteira Python↔C++/CUDA é pago uma vez só (ou por
+porta, mas com bindings finas o bastante para não importar), não a cada
+passo de um laço de treino. As comparações "empate técnico com cuStateVec"
+e "8,0× contra o Aer" já registradas no README não precisam de correção.
+
 ### A GPU de notebook muda de clock sozinha
 
 A mesma configuração mediu de **1,9 a 2,4 ms** entre execuções, e a placa variou
