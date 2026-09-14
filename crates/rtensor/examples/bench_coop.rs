@@ -15,7 +15,13 @@
 //! - A e B em `f16` (as únicas configurações que a placa anuncia), acumulador
 //!   em `f32`;
 //! - cada subgrupo carrega seu `C` uma vez, acumula `K/16` passos com
-//!   `coopMultiplyAdd` e devolve uma vez.
+//!   `coopMultiplyAdd` e devolve uma vez;
+//! - **buffer duplo**: as leituras globais do ladrilho `t+1` são emitidas
+//!   antes do `coopMultiplyAdd` sobre o ladrilho `t`, com dois ladrilhos `sa`
+//!   e `sb` alternados — o mesmo padrão de `gemm::MM_FAST`;
+//! - **rasterização L2**: o despacho é linear (`(m/64)·(n/64)` workgroups em
+//!   1-D) e o índice de bloco é reconstruído com o mesmo `bloco()` do kernel
+//!   escalar, com `grupo = 8`.
 //!
 //! # O que decide
 //!
@@ -23,9 +29,9 @@
 //! teto de ~5 TFLOP/s imposto pelo canal da memória compartilhada a 1 flop
 //! por byte. O cooperativo troca o laço interno por `coopMultiplyAdd` — se os
 //! tensor cores pagam os dois preços conhecidos (`unsafe` e operandos `f16`),
-//! aparece aqui. A comparação é de intenção: o kernel escalar tem buffer
-//! duplo, rasterização de L2 e Strassen opcionais; este é o primeiro corte do
-//! cooperativo.
+//! aparece aqui. O primeiro corte (sem buffer duplo nem rasterização L2) já
+//! mediu 5.756–5.988 GFLOP/s em 4096³; com as duas otimizações que faltavam,
+//! esta versão mede o teto do desenho comum.
 //!
 //! # Ressalvas de método
 //!
@@ -44,14 +50,16 @@ const FONTE: &str = r#"
 enable f16;
 enable wgpu_cooperative_matrix;
 
+struct Dims { m: u32, n: u32, k: u32, grid_x: u32, grupo: u32, p0: u32, p1: u32, p2: u32 };
+
 @group(0) @binding(0) var<storage, read> a: array<f16>;
 @group(0) @binding(1) var<storage, read> b: array<f16>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
-@group(0) @binding(3) var<uniform> dims: vec4<u32>; // M, N, K, —
+@group(0) @binding(3) var<uniform> dims: Dims;
 
-// Painéis do passo de K: A 64×16 e B 16×64, em f16.
-var<workgroup> sa: array<f16, 1024>;
-var<workgroup> sb: array<f16, 1024>;
+// Dois ladrilhos, alternados — igual ao buffer duplo do kernel escalar.
+var<workgroup> sa: array<f16, 2048>;
+var<workgroup> sb: array<f16, 2048>;
 // Dois ladrilhos C 16×16 f32 por subgrupo — a saída do kernel passa por aqui
 // porque o naga 30.0.1 entra em pânico no caminho de índice do SPIR-V quando
 // `coopLoad`/`coopStore` recebem ponteiro dinâmico para buffer de
@@ -59,17 +67,64 @@ var<workgroup> sb: array<f16, 1024>;
 // de entrada e saída dos slots são operações planas, que não tocam no bug.
 var<workgroup> sc: array<f32, 4096>;
 
+// Ordem de percurso dos blocos com consciência de L2 — mesma lógica de
+// `gemm::MM_FAST::bloco`, portada aqui. `grupo = 1` reproduz o percurso em
+// linha.
+fn bloco(pid: u32, nm: u32, nn: u32) -> vec2<u32> {
+    let grupo = max(dims.grupo, 1u);
+    let por_grupo = grupo * nn;
+    let gid = pid / por_grupo;
+    let m0 = gid * grupo;
+    let tam = max(min(nm - m0, grupo), 1u);
+    return vec2<u32>(m0 + (pid % tam), (pid % por_grupo) / tam);
+}
+
+fn carregar_a(m0: u32, k0: u32, ca: u32, ra: u32, K: u32) -> vec4<f16> {
+    return vec4<f16>(
+        a[(m0 + ra) * K + k0 + ca],
+        a[(m0 + ra + 16u) * K + k0 + ca],
+        a[(m0 + ra + 32u) * K + k0 + ca],
+        a[(m0 + ra + 48u) * K + k0 + ca],
+    );
+}
+
+fn guardar_a(buf: u32, ca: u32, ra: u32, v: vec4<f16>) {
+    sa[buf * 1024u + ra * 16u + ca] = v.x;
+    sa[buf * 1024u + (ra + 16u) * 16u + ca] = v.y;
+    sa[buf * 1024u + (ra + 32u) * 16u + ca] = v.z;
+    sa[buf * 1024u + (ra + 48u) * 16u + ca] = v.w;
+}
+
+fn carregar_b(n0: u32, k0: u32, rb: u32, cb: u32, N: u32) -> vec4<f16> {
+    return vec4<f16>(
+        b[(k0 + rb) * N + n0 + cb],
+        b[(k0 + rb) * N + n0 + cb + 1u],
+        b[(k0 + rb) * N + n0 + cb + 2u],
+        b[(k0 + rb) * N + n0 + cb + 3u],
+    );
+}
+
+fn guardar_b(buf: u32, rb: u32, cb: u32, v: vec4<f16>) {
+    sb[buf * 1024u + rb * 64u + cb] = v.x;
+    sb[buf * 1024u + rb * 64u + cb + 1u] = v.y;
+    sb[buf * 1024u + rb * 64u + cb + 2u] = v.z;
+    sb[buf * 1024u + rb * 64u + cb + 3u] = v.w;
+}
+
 @compute @workgroup_size(256, 1, 1)
 fn mm(
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) l: vec3<u32>,
 ) {
-    let M = dims.x;
-    let N = dims.y;
-    let K = dims.z;
+    let M = dims.m;
+    let N = dims.n;
+    let K = dims.k;
+    let nm = dims.grid_x;
+    let nn = N / 64u;
 
-    let m0 = wg.x * 64u;
-    let n0 = wg.y * 64u;
+    let bid = bloco(wg.x, nm, nn);
+    let m0 = bid.x * 64u;
+    let n0 = bid.y * 64u;
     let s = l.x / 32u; // subgrupo, 0..8
     let lane = l.x % 32u;
     let linha = s % 4u; // bloco de 16 linhas deste subgrupo
@@ -96,12 +151,105 @@ fn mm(
     var mc0 = coopLoadT<coop_mat16x16<f32, C>>(&sc[slot], 16u);
     var mc1 = coopLoadT<coop_mat16x16<f32, C>>(&sc[slot + 256u], 16u);
 
+    // Carga do primeiro ladrilho, buffer 0.
+    guardar_a(0u, ca, ra, carregar_a(m0, 0u, ca, ra, K));
+    guardar_b(0u, rb, cb, carregar_b(n0, 0u, rb, cb, N));
+    workgroupBarrier();
+
+    let passos = K / 16u;
+    var cur = 0u;
+    for (var t = 0u; t < passos; t = t + 1u) {
+        let tem_proximo = t + 1u < passos;
+        var prox_a: vec4<f16>;
+        var prox_b: vec4<f16>;
+        if (tem_proximo) {
+            // Emitidas antes do `coopMultiplyAdd`: a latência da memória
+            // global corre por baixo do cálculo do ladrilho atual.
+            prox_a = carregar_a(m0, (t + 1u) * 16u, ca, ra, K);
+            prox_b = carregar_b(n0, (t + 1u) * 16u, rb, cb, N);
+        }
+
+        let ma = coopLoadT<coop_mat16x16<f16, A>>(&sa[cur * 1024u + base_ma], 16u);
+        let mb0 = coopLoadT<coop_mat16x16<f16, B>>(&sb[cur * 1024u + base_mb0], 64u);
+        let mb1 = coopLoadT<coop_mat16x16<f16, B>>(&sb[cur * 1024u + base_mb1], 64u);
+        mc0 = coopMultiplyAdd(ma, mb0, mc0);
+        mc1 = coopMultiplyAdd(ma, mb1, mc1);
+
+        if (tem_proximo) {
+            guardar_a(1u - cur, ca, ra, prox_a);
+            guardar_b(1u - cur, rb, cb, prox_b);
+        }
+        workgroupBarrier();
+        cur = 1u - cur;
+    }
+
+    // Devolve: store cooperativo no slot (base fixa), barreira, cópia plana
+    // para o buffer de saída.
+    coopStoreT(mc0, &sc[slot], 16u);
+    coopStoreT(mc1, &sc[slot + 256u], 16u);
+    workgroupBarrier();
+    for (var i = lane; i < 256u; i = i + 32u) {
+        c[base_c + (i / 16u) * N + i % 16u] = sc[slot + i];
+    }
+    for (var i = lane; i < 256u; i = i + 32u) {
+        c[base_c + 16u + (i / 16u) * N + i % 16u] = sc[slot + 256u + i];
+    }
+}
+"#;
+
+/// O primeiro corte, sem buffer duplo nem rasterização L2 — preservado aqui
+/// só para a comparação lado a lado, no mesmo processo, contra `FONTE`. Mede
+/// **5.756–5.988 GFLOP/s em 4096³** no README; ver ali para a origem.
+const FONTE_ANTIGA: &str = r#"
+enable f16;
+enable wgpu_cooperative_matrix;
+
+@group(0) @binding(0) var<storage, read> a: array<f16>;
+@group(0) @binding(1) var<storage, read> b: array<f16>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> dims: vec4<u32>; // M, N, K, —
+
+var<workgroup> sa: array<f16, 1024>;
+var<workgroup> sb: array<f16, 1024>;
+var<workgroup> sc: array<f32, 4096>;
+
+@compute @workgroup_size(256, 1, 1)
+fn mm(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) l: vec3<u32>,
+) {
+    let M = dims.x;
+    let N = dims.y;
+    let K = dims.z;
+
+    let m0 = wg.x * 64u;
+    let n0 = wg.y * 64u;
+    let s = l.x / 32u;
+    let lane = l.x % 32u;
+    let linha = s % 4u;
+    let col0 = (s / 4u) * 2u;
+
+    let base_ma = linha * 256u;
+    let base_mb0 = col0 * 16u;
+    let base_mb1 = (col0 + 1u) * 16u;
+    let slot = s * 512u;
+    let base_c = (m0 + linha * 16u) * N + n0 + col0 * 16u;
+
+    let ca = l.x % 16u;
+    let ra = l.x / 16u;
+    let rb = l.x / 16u;
+    let cb = (l.x % 16u) * 4u;
+
+    for (var i = lane; i < 512u; i = i + 32u) {
+        sc[slot + i] = 0.0;
+    }
+    workgroupBarrier();
+    var mc0 = coopLoadT<coop_mat16x16<f32, C>>(&sc[slot], 16u);
+    var mc1 = coopLoadT<coop_mat16x16<f32, C>>(&sc[slot + 256u], 16u);
+
     let passos = K / 16u;
     for (var t = 0u; t < passos; t = t + 1u) {
         let k0 = t * 16u;
-
-        // Estagiagem: 4 linhas de A (1 elemento cada) e 4 elementos
-        // contíguos de B por thread — 8 por thread, sem divisão no laço.
         for (var q = 0u; q < 64u; q = q + 16u) {
             let r = ra + q;
             sa[r * 16u + ca] = a[(m0 + r) * K + k0 + ca];
@@ -119,8 +267,6 @@ fn mm(
         workgroupBarrier();
     }
 
-    // Devolve: store cooperativo no slot (base fixa), barreira, cópia plana
-    // para o buffer de saída.
     coopStoreT(mc0, &sc[slot], 16u);
     coopStoreT(mc1, &sc[slot + 256u], 16u);
     workgroupBarrier();
@@ -220,130 +366,160 @@ fn main() {
     }))
     .expect("dispositivo");
 
-    let m = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("mm_coop"),
-        source: wgpu::ShaderSource::Wgsl(FONTE.into()),
-    });
-    let p = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: None,
-        layout: None,
-        module: &m,
-        entry_point: Some("mm"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-
-    println!("      N |   GFLOP/s | ms");
-    for &n in &[2048u32, 4096] {
-        let k = n;
-        let m = n;
-
-        // A e B aleatórios em [-1, 1], já arredondados para f16.
-        let mut r = Aleatorio(0x20140815);
-        let a: Vec<u16> = (0..(m * k)).map(|_| f32_para_f16(r.proximo())).collect();
-        let b: Vec<u16> = (0..(k * n)).map(|_| f32_para_f16(r.proximo())).collect();
-        let c: Vec<f32> = vec![0.0; (m * n) as usize];
-
-        let ba = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    // As duas variantes, no mesmo processo e no mesmo dispositivo — evita a
+    // deriva de clock entre execuções separadas, já documentada em
+    // RESULTADOS-NEGATIVOS.md.
+    println!("{:>10} {:>7} | {:>9} | {:>5}", "kernel", "N", "GFLOP/s", "ms");
+    let mut base: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    for (nome, fonte, tem_grupo) in [("antigo", FONTE_ANTIGA, false), ("novo", FONTE, true)] {
+        let m = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(nome),
+            source: wgpu::ShaderSource::Wgsl(fonte.into()),
+        });
+        let p = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
-            contents: bytemuck::cast_slice(&a),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let bb = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&b),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let bc = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&c),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let dims = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&[m, n, k, 0u32]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &p.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: ba.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: bb.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: bc.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
-            ],
+            layout: None,
+            module: &m,
+            entry_point: Some("mm"),
+            compilation_options: Default::default(),
+            cache: None,
         });
 
-        let leitura = dev.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (m * n * 4) as u64,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        for &n in &[2048u32, 4096] {
+            let k = n;
+            let m = n;
 
-        let rodar = |enc: &mut wgpu::CommandEncoder| {
-            let mut cp = enc.begin_compute_pass(&Default::default());
-            cp.set_pipeline(&p);
-            cp.set_bind_group(0, &bg, &[]);
-            cp.dispatch_workgroups(m / 64, n / 64, 1);
-        };
+            // A e B aleatórios em [-1, 1], já arredondados para f16.
+            let mut r = Aleatorio(0x20140815);
+            let a: Vec<u16> = (0..(m * k)).map(|_| f32_para_f16(r.proximo())).collect();
+            let b: Vec<u16> = (0..(k * n)).map(|_| f32_para_f16(r.proximo())).collect();
+            let c: Vec<f32> = vec![0.0; (m * n) as usize];
 
-        // Aquecimento.
-        for _ in 0..2 {
-            let mut enc = dev.create_command_encoder(&Default::default());
-            rodar(&mut enc);
-            q.submit(Some(enc.finish()));
-            dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        }
+            let ba = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&a),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let bb = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&b),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let bc = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&c),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            });
+            let dims = if tem_grupo {
+                let grid_x = m / 64;
+                let grupo = 8u32; // mesmo padrão do kernel escalar em produção
+                dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&[m, n, k, grid_x, grupo, 0u32, 0u32, 0u32]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+            } else {
+                dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&[m, n, k, 0u32]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                })
+            };
+            let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &p.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: ba.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: bb.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: bc.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: dims.as_entire_binding() },
+                ],
+            });
 
-        // Medição: 8 execuções, mediana.
-        let mut tempos: Vec<f64> = Vec::new();
-        for _ in 0..8 {
-            let mut enc = dev.create_command_encoder(&Default::default());
-            rodar(&mut enc);
-            enc.copy_buffer_to_buffer(&bc, 0, &leitura, 0, (m * n * 4) as u64);
-            let inicio = std::time::Instant::now();
-            q.submit(Some(enc.finish()));
-            dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            tempos.push(inicio.elapsed().as_secs_f64() * 1e3);
-        }
-        tempos.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let ms = tempos[tempos.len() / 2];
-        let gflops = 2.0 * (m as f64) * (n as f64) * (k as f64) / (ms / 1e3) / 1e9;
+            let leitura = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (m * n * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
 
-        // Conferência numérica: um bloco 32×32 amostral, referência em f64
-        // sobre os operandos já em f16.
-        let slice = leitura.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        rx.recv().unwrap().unwrap();
-        let vista = slice.get_mapped_range().unwrap();
-        let obtido: Vec<f32> = bytemuck::cast_slice(&vista[..]).to_vec();
-        drop(vista);
-
-        let i0 = ((m as usize) / 3) & !31;
-        let j0 = ((n as usize) / 5) & !31;
-        let mut erro = 0.0f64;
-        let mut norma = 0.0f64;
-        for i in i0..i0 + 32 {
-            for j in j0..j0 + 32 {
-                let mut e = 0.0f64;
-                for t in 0..k as usize {
-                    e += f16_para_f32_ref(a[i * k as usize + t]) as f64
-                        * f16_para_f32_ref(b[t * n as usize + j]) as f64;
+            // Despacho 2-D no antigo (sem rasterização), 1-D linear no novo.
+            let gx = m / 64;
+            let gy = n / 64;
+            let rodar = |enc: &mut wgpu::CommandEncoder| {
+                let mut cp = enc.begin_compute_pass(&Default::default());
+                cp.set_pipeline(&p);
+                cp.set_bind_group(0, &bg, &[]);
+                if tem_grupo {
+                    cp.dispatch_workgroups(gx * gy, 1, 1);
+                } else {
+                    cp.dispatch_workgroups(gx, gy, 1);
                 }
-                erro = erro.max((obtido[i * n as usize + j] as f64 - e).abs());
-                norma = norma.max(e.abs());
+            };
+
+            // Aquecimento.
+            for _ in 0..2 {
+                let mut enc = dev.create_command_encoder(&Default::default());
+                rodar(&mut enc);
+                q.submit(Some(enc.finish()));
+                dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
             }
+
+            // Medição: 8 execuções, mediana.
+            let mut tempos: Vec<f64> = Vec::new();
+            for _ in 0..8 {
+                let mut enc = dev.create_command_encoder(&Default::default());
+                rodar(&mut enc);
+                enc.copy_buffer_to_buffer(&bc, 0, &leitura, 0, (m * n * 4) as u64);
+                let inicio = std::time::Instant::now();
+                q.submit(Some(enc.finish()));
+                dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                tempos.push(inicio.elapsed().as_secs_f64() * 1e3);
+            }
+            tempos.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let ms = tempos[tempos.len() / 2];
+            let gflops = 2.0 * (m as f64) * (n as f64) * (k as f64) / (ms / 1e3) / 1e9;
+
+            // Conferência numérica: um bloco 32×32 amostral, referência em f64
+            // sobre os operandos já em f16.
+            let slice = leitura.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            rx.recv().unwrap().unwrap();
+            let vista = slice.get_mapped_range().unwrap();
+            let obtido: Vec<f32> = bytemuck::cast_slice(&vista[..]).to_vec();
+            drop(vista);
+
+            let i0 = ((m as usize) / 3) & !31;
+            let j0 = ((n as usize) / 5) & !31;
+            let mut erro = 0.0f64;
+            let mut norma = 0.0f64;
+            for i in i0..i0 + 32 {
+                for j in j0..j0 + 32 {
+                    let mut e = 0.0f64;
+                    for t in 0..k as usize {
+                        e += f16_para_f32_ref(a[i * k as usize + t]) as f64
+                            * f16_para_f32_ref(b[t * n as usize + j]) as f64;
+                    }
+                    erro = erro.max((obtido[i * n as usize + j] as f64 - e).abs());
+                    norma = norma.max(e.abs());
+                }
+            }
+
+            let ganho = if let Some(&b0) = base.get(&n) {
+                format!("{:+.1}%", 100.0 * (gflops / b0 - 1.0))
+            } else {
+                base.insert(n, gflops);
+                "(base)".to_string()
+            };
+            println!(
+                "{:>10} {:>7} | {:>9.0} | {:>5.1} | {ganho:>8} | erro bloco: {erro:.2e} (norma {norma:.1})",
+                nome, n, gflops, ms
+            );
         }
-        println!(
-            "{:>7} | {:>9.0} | {:>5.1} | erro bloco: {erro:.2e} (norma {norma:.1})",
-            n, gflops, ms
-        );
     }
 }
 

@@ -48,6 +48,10 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(512);
+    let passos_cli: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
 
     type B = Autodiff<Wgpu>;
     let dev = WgpuDevice::default();
@@ -76,13 +80,12 @@ fn main() {
     }
     <B as Backend>::sync(&dev);
 
-    const PASSOS: usize = 200;
     let inicio = Instant::now();
-    for _ in 0..PASSOS {
+    for _ in 0..passos_cli {
         model = passo(model, &mut otim);
     }
     <B as Backend>::sync(&dev);
-    let dt = inicio.elapsed().as_secs_f64() / PASSOS as f64;
+    let dt = inicio.elapsed().as_secs_f64() / passos_cli as f64;
 
     let flop = (D * H + H * H + H * C) as f64 * 3.0 * 2.0 * lote as f64;
     println!("motor=burn-wgpu|lote={lote}|ms={:.4}|gflops={:.1}", dt * 1e3, flop / dt / 1e9);

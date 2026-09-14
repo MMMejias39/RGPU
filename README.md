@@ -267,7 +267,7 @@ por workgroup de 256 threads (8 subgrupos), dois ladrilhos de 16×16 por
 subgrupo, `K` em passos de 16 com estagiagem em memória de workgroup, `f16` em
 A e B com acumulador `f32`:
 
-| `N` | cooperativo | escalar | ganho |
+| `N` | cooperativo (1º corte) | escalar | ganho |
 |---|---:|---:|---:|
 | 2048³ | 4.369–4.466 | 4.386 | par |
 | 4096³ | 5.756–5.988 | 3.804–4.243 | **+37% a +50%** |
@@ -275,6 +275,22 @@ A e B com acumulador `f32`:
 O ganho vai além da banda: a precisão mista sozinha rendera +1 a 7% no kernel
 escalar, e aqui são ~40% — os tensor cores somam aritmética de verdade. E o
 erro é o esperado da conversão `f16` (~1e-5 relativo), sem acumulação visível.
+
+**O primeiro corte não tinha buffer duplo nem rasterização L2** — as duas
+otimizações que o kernel escalar já usa. Implementadas (mesmo desenho:
+ladrilhos `sa`/`sb` alternados, despacho linear com `bloco()` idêntico ao de
+`gemm::MM_FAST`), medidas no mesmo processo contra o corte anterior — que
+evita a deriva de clock documentada em RESULTADOS-NEGATIVOS.md — em 6
+execuções:
+
+| `N` | ganho sobre o 1º corte | GFLOP/s (novo) | distância do cuBLAS |
+|---|---:|---:|---:|
+| 2048³ | +8,4% a +23,0% (média ~13%) | 4.386–4.809 | — |
+| 4096³ | +17,6% a +32,5% (média ~27%) | **7.087–7.204** | **1,67×** (era ~2×) |
+
+O erro numérico não muda (mesma conversão `f16`, mesma acumulação `f32`) —
+só o padrão de acesso à memória. `+63%` sobre o kernel escalar em produção
+(4.386 GFLOP/s), contra os +37–50% do primeiro corte.
 
 Dois preços, e agora são os únicos obstáculos:
 
@@ -677,6 +693,40 @@ mais eficiente que um núcleo.
 domínio `uncore` do RAPL cobre só a iGPU dentro do SoC. O número da Intel está
 provavelmente subestimado, o que reforça a conclusão.
 
+### Entre motores de deep learning — e uma armadilha no número mais alto
+
+A comparação acima é entre fabricantes de GPU, com o mesmo código. Esta é
+entre motores — `rtensor`, burn, PyTorch e TensorFlow —, mesma MLP
+512→1024→1024→10, lote 512. `rtensor` usa `examples/energia.rs` (mede o laço
+interno, sem o custo de processo). Os outros três são medidos por fora com
+`rqubit::examples::medir_externo`, por diferença entre duas contagens de
+passos (1.000 e 6.000) — a mesma técnica de `benchmarks/quantum/README.md`,
+necessária porque o import de Python (~30% do tempo, ver a seção de
+despacho acima) senão entraria na conta:
+
+| Motor | ms/passo | GFLOP/s | J/passo (acima da ociosidade) | W acima da ociosidade | GFLOP/J |
+|---|---:|---:|---:|---:|---:|
+| burn-wgpu | 1,146 | 4.243,6 | 0,0430 | **37,6** | **112,99** |
+| rtensor GPU | 1,459 | 3.333,5 | 0,0855 | 58,6 | 56,89 |
+| torch-cuda | 1,483 | 3.279,3 | 0,0793 | 53,5 | 61,29 |
+| tensorflow | 1,868 | 2.603,1 | 0,0163 | **8,7** | **298,7** |
+
+**O número do TensorFlow é uma armadilha.** Isolado, parece o motor mais
+eficiente por joule — 298,7 GFLOP/J, 2,6× o burn. A coluna de potência
+desmente: a GPU do TensorFlow roda a **8,7 W acima da ociosidade**, contra
+37–59 W dos outros três. É a mesma causa da seção de despacho: ~30% do tempo
+do TF é overhead de `tf.function`, e nesse tempo a GPU fica parada. Energia é
+potência × tempo — GPU quase ociosa por mais tempo dá poucos joules totais,
+mas não porque o trabalho seja eficiente, e sim porque há pouco trabalho por
+segundo de relógio. Um "GFLOP/J" alto aqui não é "faz mais por joule", é
+"gasta pouco porque faz pouco".
+
+**Sem essa distorção, a ordem é burn > torch > rtensor** — o burn quase 2×
+mais eficiente que o `rtensor`, o mesmo "resultado mais desconfortável" já
+registrado acima, agora também em energia, não só em tempo. Scripts:
+`benchmarks/python/energia_tf.py`, `energia_torch.py`,
+`benchmarks/rivais/src/burn_bench.rs` (com contagem de passos configurável).
+
 ### Eficiência contra frequência
 
 Nove frequências, mesma carga, **energia total** (a ociosidade não é subtraível
@@ -790,7 +840,7 @@ Resumo das tentativas, com o estado atual:
 | Precisão mista `f16` (GEMM) | +1 a 7% de velocidade, −5 a 11% de energia | mantida por capacidade, não por velocidade |
 | GEMM com `A` via `subgroupShuffle` | sonda isolada +3 a 9% (real); kernel completo −3,4% a +2,5%, média −0,7% | [revertido](experimentos/gemm-subgrupo/) |
 | **Retificado** | | |
-| Matriz cooperativa (tensor cores) | "não funcional" era diagnóstico errado: **funciona**, +37 a +50% em 4096³ | decisão pendente: exige `unsafe` e operandos `f16` |
+| Matriz cooperativa (tensor cores) | "não funcional" era diagnóstico errado: **funciona**; com buffer duplo e rasterização L2, +63% sobre o escalar e 1,67× do cuBLAS | decisão pendente: exige `unsafe` e operandos `f16` |
 
 São **onze** otimizações que não pagaram, cada uma com números e causa
 identificada, ao lado das que pagaram. O código revertido fica preservado em

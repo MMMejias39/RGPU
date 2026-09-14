@@ -48,6 +48,7 @@ negativo tem lugar neste repositório.
 | Fusão até 6 qubits em 22 qubits (QFT) | **−34%** (90,7 ms contra 67,6) | cruzamento medido entre 22 e 24 |
 | Fusão de 2 qubits em `f16` (QFT) | **+11% de tempo**, mas **+34% de energia** | ganho de tempo sem ganho de energia |
 | Matriz cooperativa (tensor cores) | o "não funcional" era diagnóstico errado: **funciona** nas configurações anunciadas; exige `unsafe` e operandos `f16` | sondas mantidas |
+| Buffer duplo + rasterização L2 no cooperativo | **+13% (2048³) e +27% (4096³)** sobre o primeiro corte; 1,67× do cuBLAS | sonda mantida, mesma decisão pendente |
 | GEMM com `A` via `subgroupShuffle` | sonda isolada: **+3 a 9%**, real; no kernel completo: **-3,4% a +2,5%** (média -0,7%) | [revertido](experimentos/gemm-subgrupo/) |
 
 ### A QFT em 22 qubits: a fusão até 6 perde, e a de 2 custa watt
@@ -178,6 +179,46 @@ somando aritmética real. O primeiro corte não tem buffer duplo nem rasterizaç
 de L2 (o escalar tem ambos); com eles, o teto do desenho comum é a próxima
 medida. O `probe_coop.rs` fica como registro do diagnóstico original e o
 `probe_coop_f16.rs` como prova do funcionamento.
+
+### Buffer duplo e rasterização L2 no cooperativo — a medida prometida, feita
+
+O parágrafo anterior deixou uma medida pendente: o primeiro corte do kernel
+cooperativo não tinha buffer duplo nem rasterização L2, as duas otimizações
+que o kernel escalar já usa. Implementadas — mesmo desenho do `MM_FAST`:
+ladrilhos `sa`/`sb` em `f16` duplicados e alternados (`cur`/`1-cur`), leituras
+globais do ladrilho `t+1` emitidas antes do `coopMultiplyAdd` sobre o ladrilho
+`t`, despacho linear com o mesmo `bloco()` (grupo de 8 linhas) reconstruindo o
+índice a partir de `workgroup_id.x` — em `crates/rtensor/examples/bench_coop.rs`.
+
+**Metodologia:** `bench_coop.rs` agora roda as duas versões — a antiga
+(`FONTE_ANTIGA`, preservada literalmente) e a nova (`FONTE`) — no mesmo
+processo e no mesmo dispositivo, o que cancela a deriva de clock entre
+execuções separadas (ver "A GPU de notebook muda de clock sozinha" abaixo).
+6 execuções do binário inteiro:
+
+| `N` | ganho sobre o 1º corte (6 execuções) | GFLOP/s, novo (min–max) |
+|---|---|---:|
+| 2048³ | +8,4%, +9,8%, +8,5%, +11,8%, +14,5%, +23,0% (média 12,7%) | 4.386–4.809 |
+| 4096³ | +17,6%, +29,0%, +30,0%, +32,5%, +20,1%, +31,6% (média 26,8%) | 7.087–7.204 |
+
+Positivo nas 12 medições (6 por tamanho). O erro numérico não muda —
+`1,97e-4` e `5,95e-4` nos blocos amostrais de 2048³ e 4096³, idêntico ao
+primeiro corte — porque nem a conversão `f16` nem a acumulação mudaram, só o
+padrão de acesso à memória global e à memória de workgroup.
+
+Contra o cuBLAS com TF32 (11.946 GFLOP/s): a distância cai de **~2×** (primeiro
+corte, 5.756–5.988) para **1,67×** (7.087–7.204). Contra o kernel escalar de
+produção (4.386 GFLOP/s em 4096³): **+63%**, acima dos +37–50% do primeiro
+corte.
+
+O ganho em 2048³ é mais instável (8,4% a 23,0%) que em 4096³ (17,6% a 32,5%)
+— o mesmo tipo de variação de execução para execução, maior em problemas
+menores, já visto em outras sondas deste repositório (a carga por workgroup é
+menor, e o ruído de agendamento pesa proporcionalmente mais).
+
+Os dois preços continuam os mesmos — `unsafe` e operandos `f16` — e não há
+nada nesta medida que os elimine. O que muda é o número que a decisão pesa: a
+matriz cooperativa agora está a 1,67× do cuBLAS, não a 2×.
 
 ### GEMM com `A` via `subgroupShuffle` — sonda real, kernel completo nulo
 

@@ -131,11 +131,15 @@ comportamento indefinido, e os zeros vinham daí. Nas configurações anunciadas
 com estagiagem em memória de workgroup (`examples/probe_coop_f16.rs`). Restam
 dois preços: `ExperimentalFeatures::enabled()` é `unsafe fn` — custaria a
 propriedade "zero `unsafe`" do projeto — e os tensor cores desta placa só
-aceitam operandos em `f16`. O veredito numérico já existe: o kernel GEMM
-cooperativo (`examples/bench_coop.rs`) mede **5.756–5.988 GFLOP/s em 4096³**
-contra 3.804–4.243 do escalar — **+37% a +50%** — e empata em 2048³. Pagar os
-dois preços (`unsafe` e `f16`) por isso é uma decisão que agora tem número.
-Detalhes em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+aceitam operandos em `f16`. O veredito numérico já existe, e já inclui as
+otimizações que faltavam: o primeiro corte do kernel GEMM cooperativo
+(`examples/bench_coop.rs`) não tinha buffer duplo nem rasterização L2 — com
+as duas, medidas no mesmo processo contra o corte anterior (6 execuções),
+**+13% em 2048³ e +27% em 4096³**, chegando a **7.087–7.204 GFLOP/s em
+4096³** — só **1,67×** atrás do cuBLAS com TF32 (era ~2×), e **+63%** sobre o
+escalar de produção. Pagar os dois preços (`unsafe` e `f16`) por isso é uma
+decisão que agora tem um número melhor. Detalhes em
+[RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
 
 A alternativa sem nenhum dos dois preços foi testada e não pagou.
 `Features::SUBGROUP` é estável, não exige `unsafe` nem `f16`, e uma sonda
