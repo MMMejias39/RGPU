@@ -455,6 +455,67 @@ termina, mas que não tem relação com CUDA ser ou não contornável — e o
 restante é, sim, o `wgpu` inicializando mais rápido e despachando sem
 traçar grafo.
 
+### A tabela de regime permanente também misturava despacho com arquitetura
+
+A mesma pergunta da partida a fria — quanto é linguagem hospedeira, quanto é
+GPU — se aplica à tabela "Tempo por passo de treino" do README, e por um
+motivo concreto: a coluna do TensorFlow é **quase plana** (1,15 a 2,05 ms de
+lote 1 a 2048), sem a escalada com o trabalho que as outras colunas mostram.
+Isso é sintoma de um custo fixo dominando a medida.
+
+`benchmarks/python/despacho_tf.py` isola o despacho: a mesma `tf.function`
+traçada, mas com um corpo quase vazio (`tf.reduce_sum(x) * 0.0 +
+tf.cast(y[0], ...)`), medida com o mesmo `cron()` — aquece, cronometra
+`reps` chamadas, sincroniza uma vez no fim — contra o passo real, no mesmo
+lote. `despacho_torch.py` e `crates/rtensor/examples/despacho_rtensor.rs`
+fazem o mesmo para PyTorch (eager) e `rtensor` (um `relu` num tensor de 1
+elemento, mesmo padrão de submissão: um `CommandEncoder`, um dispatch, um
+`submit`).
+
+| Motor | passo real (lote 1–2048) | despacho trivial | despacho, % do passo |
+|---|---:|---:|---:|
+| TensorFlow | 1,68–2,09 ms | **0,43–0,70 ms** | **23% a 36% (~29%)** |
+| PyTorch | 1,01–2,27 ms | 0,04–0,06 ms | 2,0% a 4,0% |
+| rtensor | 0,49–5,89 ms | 0,03–0,07 ms | 0,5% a 13%, caindo com o lote |
+
+Números por lote (3 execuções cada, TensorFlow e PyTorch; 2 execuções,
+`rtensor`):
+
+```
+TF       lote=1    real=1,71–1,93 ms  trivial=0,43–0,56 ms  despacho=25–29%
+TF       lote=128  real=1,70–2,04 ms  trivial=0,56–0,65 ms  despacho=31–33%
+TF       lote=2048 real=1,75–1,92 ms  trivial=0,42–0,62 ms  despacho=23–32%
+
+torch    lote=1    real=1,01–1,48 ms  trivial=0,041 ms      despacho=2,8–4,0%
+torch    lote=128  real=1,07–1,59 ms  trivial=0,041 ms      despacho=2,6–3,8%
+torch    lote=2048 real=2,26–2,27 ms  trivial=0,046 ms      despacho=2,0–2,1%
+
+rtensor  lote=1    real=0,49–0,66 ms  trivial=0,029–0,052 ms  despacho=5,3–7,9%
+rtensor  lote=128  real=0,94–1,05 ms  trivial=0,029–0,030 ms  despacho=2,8–3,1%
+rtensor  lote=2048 real=4,85–5,89 ms  trivial=0,029–0,030 ms  despacho=0,5–0,6%
+```
+
+**Cerca de 30% de cada número da coluna TF GPU é despachar a chamada, não
+computar** — um custo fixo de ~0,5 ms, essencialmente independente do lote,
+o que explica a planura da coluna. `torch` e `rtensor` têm despacho perto do
+desprezível (2–4% e 1–8%, respectivamente) — a diferença entre eles na
+tabela principal é computação de verdade, não overhead de linguagem.
+
+A causa arquitetural é conhecida da literatura: o modo eager do PyTorch
+despacha a operação C++ direto, enquanto o `tf.function` do TensorFlow, mesmo
+já traçado, passa por uma camada de execução de grafo (`FunctionLibraryRuntime`)
+a cada chamada — mais pesada que uma chamada eager, e completamente
+independente de CUDA ou de qualquer coisa que este repositório meça sobre
+GPU.
+
+**O que isso não muda**: nenhum vencedor de linha na tabela principal troca
+de mãos — o PyTorch já vencia todo o intervalo, e o `rtensor` já perdia em
+lote grande. **O que muda**: a leitura de que o TensorFlow é uniformemente
+~3× pior que o `rtensor` em lote pequeno superestima o que é arquitetura de
+GPU; cerca de um terço disso é o mesmo imposto de linguagem hospedeira já
+identificado na partida a fria, só que pago a cada passo em vez de uma vez
+só.
+
 ### A GPU de notebook muda de clock sozinha
 
 A mesma configuração mediu de **1,9 a 2,4 ms** entre execuções, e a placa variou

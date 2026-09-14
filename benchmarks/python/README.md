@@ -34,6 +34,8 @@ export LD_LIBRARY_PATH=$(find venv/lib/python3.12/site-packages/nvidia \
 | `frio_torch.py` | Partida a frio do PyTorch; meça o processo inteiro com `time` |
 | `frio_decomposto_tf.py` | Partida a fria do TensorFlow, separada em import / montagem do modelo e GPU / primeiro passo |
 | `frio_decomposto_torch.py` | O mesmo para PyTorch — usado para separar imposto de import de arquitetura na comparação de partida a fria |
+| `despacho_tf.py` | `despacho_tf.py <lote>` — isola o custo de despachar uma `tf.function` traçada (corpo trivial) do custo do passo real, no regime permanente |
+| `despacho_torch.py` | `despacho_torch.py <lote>` — o mesmo para PyTorch eager |
 | `tf32_probe.py` | Liga e desliga os tensor cores TF32 para medir quanto eles valem |
 
 ## Uso

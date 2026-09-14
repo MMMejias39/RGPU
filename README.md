@@ -58,6 +58,28 @@ Milissegundos por passo, menor é melhor; **negrito** marca o vencedor da linha.
 plano — 0,52 a 0,65 ms de lote 1 a 512. O `rtensor` é competitivo em lote
 pequeno e médio, e perde em lote grande.
 
+*Ressalva:* a coluna do TensorFlow é **notavelmente plana** — 1,15 a 2,05 ms
+em toda a faixa de lote, quase sem escalar com o trabalho — e isso tem
+explicação: `benchmarks/python/despacho_tf.py` mede o despacho de uma
+`tf.function` **trivial** (soma quase nula, mesmo padrão de chamada) contra o
+passo real, no mesmo lote:
+
+| Motor | passo real | despacho trivial | despacho, % do passo |
+|---|---:|---:|---:|
+| TensorFlow | 1,68–2,09 ms | **0,43–0,70 ms** | **~29%** |
+| PyTorch | 1,01–2,27 ms | 0,04–0,06 ms | ~3% |
+| rtensor (`despacho_rtensor.rs`) | 0,49–5,89 ms | 0,03–0,07 ms | 1–10%, caindo com o lote |
+
+Cerca de **30% de cada número da coluna TF GPU é só despachar a chamada** —
+Python entrando na função traçada —, não computar. É por isso que a coluna
+quase não escala: um custo fixo de ~0,5 ms domina o tempo em lotes pequenos
+e médios, e só fica pequeno relativo ao resto em lote 2048. `torch` e
+`rtensor` têm despacho perto do desprezível — a diferença entre eles nesta
+tabela é mesmo computação. Isso não muda o vencedor de nenhuma linha, mas
+explica por que o TensorFlow parece "travado" num único número: ele está.
+Metodologia e os três scripts (`despacho_tf.py`, `despacho_torch.py`,
+`despacho_rtensor.rs`) em [RESULTADOS-NEGATIVOS.md](RESULTADOS-NEGATIVOS.md).
+
 ### O resultado mais desconfortável
 
 O **burn** passa pelo **mesmo caminho de hardware** que o `rtensor`: wgpu sobre
